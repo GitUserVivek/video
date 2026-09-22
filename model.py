@@ -226,26 +226,36 @@ _SIZE_HINTS = {
 # huggingface_hub's ignore_patterns filtering is unreliable on large repos —
 # it queues all blobs first, then filters, so partial downloads still pull
 # everything. hf_hub_download fetches one file at a time, guaranteed.
+# _REQUIRED_FILES: dict[str, list[str]] = {
+#     "Lightricks/LTX-Video": [
+#         # Pipeline config
+#         "model_index.json",
+#         # Transformer config + weights (latest 2B checkpoint)
+#         "transformer/config.json",
+#         "ltx-video-2b-v0.9.5.safetensors",
+#         # VAE
+#         "vae/config.json",
+#         # Text encoder (T5)
+#         "text_encoder/config.json",
+#         "tokenizer/special_tokens_map.json",
+#         "tokenizer/spiece.model",
+#         "tokenizer/tokenizer.json",
+#         "tokenizer/tokenizer_config.json",
+#         # Scheduler
+#         "scheduler/scheduler_config.json",
+#     ],
+# }
 _REQUIRED_FILES: dict[str, list[str]] = {
     "Lightricks/LTX-Video": [
-        # Pipeline config
         "model_index.json",
-        # Transformer config + weights (latest 2B checkpoint)
         "transformer/config.json",
         "ltx-video-2b-v0.9.5.safetensors",
-        # VAE
         "vae/config.json",
-        # Text encoder (T5)
         "text_encoder/config.json",
         "tokenizer/special_tokens_map.json",
         "tokenizer/spiece.model",
-        "tokenizer/tokenizer.json",
-        "tokenizer/tokenizer_config.json",
-        # Scheduler
-        "scheduler/scheduler_config.json",
     ],
 }
-
 
 def ensure_model_downloaded(repo_id: str) -> Path:
     """Download only the exact files needed for inference.
@@ -277,6 +287,67 @@ def ensure_model_downloaded(repo_id: str) -> Path:
 
 
 def _download_exact_files(repo_id: str, files: list[str]) -> Path:
+    """Download only explicitly requested files from Hugging Face."""
+
+    from huggingface_hub import hf_hub_download
+
+    print(
+        f"[model] Fetching {len(files)} file(s) "
+        f"(exact list — skips all other weights)"
+    )
+
+    downloaded = 0
+    failed = []
+
+    for filename in files:
+        try:
+            path = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                cache_dir=str(HF_CACHE / "hub"),
+                token=HF_TOKEN or None,
+            )
+
+            size_mb = Path(path).stat().st_size / 1e6
+
+            print(
+                f"[model]   ✓  {filename}  "
+                f"({size_mb:.0f} MB)"
+            )
+
+            downloaded += 1
+
+        except Exception as exc:
+            print(
+                f"[model]   ✗  {filename}  "
+                f"({type(exc).__name__}: {exc})"
+            )
+            failed.append(filename)
+
+    if failed:
+        raise RuntimeError(
+            f"Failed to download required files from {repo_id}:\n"
+            + "\n".join(f"  - {f}" for f in failed)
+        )
+
+    print(
+        f"[model] Downloaded {downloaded} file(s) "
+        f"to HF cache"
+    )
+
+    # Return the actual HF snapshot directory.
+    from huggingface_hub import snapshot_download
+
+    snapshot_path = snapshot_download(
+        repo_id=repo_id,
+        cache_dir=str(HF_CACHE / "hub"),
+        local_files_only=True,
+        token=HF_TOKEN or None,
+    )
+
+    return Path(snapshot_path)
+
+def _download_exact_files_old(repo_id: str, files: list[str]) -> Path:
     """Download a specific list of files from a HuggingFace repo."""
     from huggingface_hub import hf_hub_download
 
