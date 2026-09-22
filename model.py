@@ -242,10 +242,13 @@ def _try_enable_xformers(pipe: Any) -> bool:
 def _apply_chunked_attention(pipe: Any, vram_gb: float) -> bool:
     """Apply chunked attention patch as fallback when xformers is unavailable.
 
-    chunk_size tuned to leave enough VRAM for weights + activations on T4.
-      T4 15 GB  → chunk_size=512  → peak attn ~300 MB
-      8 GB GPU  → chunk_size=256  → peak attn ~150 MB
-      ≥24 GB    → chunk_size=2048 → peak attn ~1.2 GB (fast)
+    `chunk_size` caps how many query tokens are scored per iteration; the kernel
+    additionally clamps it so a single score block stays under ~512 MB (CogVideoX
+    runs joint text+video attention, so a 480p/49-frame pass would otherwise need
+    ~52 GB for one block's fp32 score matrix).
+      T4 15 GB  → chunk_size=512
+      8 GB GPU  → chunk_size=256
+      ≥24 GB    → chunk_size=2048 (fast)
     """
     try:
         from chunked_attention import patch_cogvideox_attention
