@@ -257,7 +257,7 @@ def main() -> int:
         num_inference_steps = args.num_steps,
         guidance_scale  = args.guidance,
         output_path     = args.output,
-        stream          = stream,
+        # stream          = stream,
         preview_every   = args.preview_every,
         segment_seconds = args.segment_secs,
         cache_dir       = args.cache_dir,

@@ -354,6 +354,8 @@ def _download_exact_files(repo_id: str, files: list[str]) -> Path:
                 filename=filename,
                 cache_dir=str(HF_CACHE / "hub"),
                 token=HF_TOKEN or None,
+                force_download=False,
+                resume_download=True,
             )
 
             size_mb = Path(path).stat().st_size / 1e6
@@ -391,6 +393,7 @@ def _download_exact_files(repo_id: str, files: list[str]) -> Path:
         cache_dir=str(HF_CACHE / "hub"),
         local_files_only=True,
         token=HF_TOKEN or None,
+        etag_timeout=30,
     )
 
     return Path(snapshot_path)
@@ -418,6 +421,8 @@ def _download_exact_files_old(repo_id: str, files: list[str]) -> Path:
                 filename=filename,
                 cache_dir=str(HF_CACHE / "hub"),
                 token=HF_TOKEN or None,
+                force_download=False,
+                resume_download=True,
             )
             # hf_hub_download returns a path inside the blob cache; symlink into our layout
             import shutil
@@ -459,6 +464,7 @@ def _download_snapshot(repo_id: str) -> Path:
             local_files_only=False,
             ignore_patterns=ignore if ignore else None,
             token=HF_TOKEN or None,
+            etag_timeout=30,
         )
     except KeyboardInterrupt:
         print("\n[model] Download cancelled — partial snapshot left on disk.")
@@ -514,7 +520,11 @@ def _load_pipeline(repo_id: str, pipeline_cls: Any, hw_cfg: dict) -> Any:
     shard    = hw_cfg.get("use_device_map", False) and hw_cfg.get("gpu_count", 0) > 1
 
     print(f"[model] Loading {cls_name} ({dtype}) …")
-    base_kwargs: dict[str, Any] = {"torch_dtype": dtype, "cache_dir": str(HF_CACHE / "hub")}
+    base_kwargs: dict[str, Any] = {
+        "torch_dtype": dtype,
+        "cache_dir": str(HF_CACHE / "hub"),
+        "use_memory_efficient_attention": False,
+    }
 
     if shard:
         # No explicit `max_memory` map: accelerate sizes its balanced split from the
@@ -523,7 +533,12 @@ def _load_pipeline(repo_id: str, pipeline_cls: Any, hw_cfg: dict) -> Any:
         # spill would slow us down, and `_report_device_map` calls that out.
         print(f"[model] device_map=\"balanced\"  ({_free_vram_report(hw_cfg)})")
         try:
-            pipe = loader.from_pretrained(repo_id, device_map="balanced", **base_kwargs)
+            pipe = loader.from_pretrained(
+                repo_id,
+                device_map="balanced",
+                max_memory=None,
+                **base_kwargs,
+            )
             _report_device_map(pipe)
             return pipe
         except Exception as exc:
@@ -606,6 +621,8 @@ def _swap_ltx_distilled_transformer(pipe: Any, repo_id: str, info: dict, hw_cfg:
             filename=distilled_file,
             cache_dir=str(HF_CACHE / "hub"),
             token=HF_TOKEN or None,
+            force_download=False,
+            resume_download=True,
         )
     except Exception as exc:
         raise RuntimeError(
