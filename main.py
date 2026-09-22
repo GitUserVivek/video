@@ -24,6 +24,9 @@ Options
   --segment-secs  Cap a single pass to N seconds of footage
   --preview-every Decode a live preview still every N steps [default: 0 = off]
   --no-compile    Disable torch.compile even when available
+  --cache-dir     Where finished passes are cached [default: ./.gen_cache]
+  --no-resume     Ignore cached passes and start from pass 1
+  --clear-cache   Delete cached runs for this cache dir, then continue
   --benchmark     Measure + compare model paths at one resolution, then exit
   --idle-timeout  Seconds of inactivity before unloading model [default: 180]
   --list-models   Show available models and exit
@@ -86,6 +89,13 @@ def _build_parser() -> argparse.ArgumentParser:
                         "(0 disables; costs ~1-2 s per preview).")
     p.add_argument("--no-compile",   action="store_true",
                    help="Disable torch.compile.")
+    p.add_argument("--cache-dir",    default=None, dest="cache_dir",
+                   help="Directory holding finished generation passes, so a failed "
+                        "run can be resumed [default: ./.gen_cache, or $VIDEO_CACHE_DIR].")
+    p.add_argument("--no-resume",    action="store_true", dest="no_resume",
+                   help="Ignore cached passes for this run and regenerate everything.")
+    p.add_argument("--clear-cache",  action="store_true", dest="clear_cache",
+                   help="Delete cached runs in the cache dir before generating.")
     p.add_argument("--idle-timeout", type=int, default=180, dest="idle_timeout",
                    help="Seconds of inactivity before unloading model from memory "
                         "(default: 180). Set 0 to disable.")
@@ -166,6 +176,11 @@ def main() -> int:
 
     print_device_summary(hw_cfg)
 
+    # ── Cache housekeeping ─────────────────────────────────────────────────
+    if args.clear_cache:
+        from cache import clear_cache
+        clear_cache(args.cache_dir)
+
     # ── Benchmark mode: measure instead of generating ──────────────────────
     if args.benchmark:
         from benchmark import run_benchmark
@@ -245,6 +260,8 @@ def main() -> int:
         stream          = stream,
         preview_every   = args.preview_every,
         segment_seconds = args.segment_secs,
+        cache_dir       = args.cache_dir,
+        resume          = not args.no_resume,
     )
 
     # Ping again after generation so the idle clock resets

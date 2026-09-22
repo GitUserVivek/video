@@ -1,4 +1,4 @@
-python main.py "a 480p sunset timelapse, 30 seconds" --fast --fps 12 --preview-every 2
-python main.py "a 480p sunset timelapse, 30 seconds" --fast --fps 12 --preview-every 2
-python main.py "a 480p sunset timelapse, 30 seconds" --fast --fps 12 --preview-every 2
-python main.py "a 480p sunset timelapse, 30 seconds" --fast --fps 12 --preview-every 2
+!python main.py "a 480p sunset timelapse, 30 seconds" --fast --fps 12 --preview-every 2
+!python main.py "a 480p sunset timelapse, 30 seconds" --fast --fps 12 --preview-every 2
+!python main.py "a 480p sunset timelapse, 30 seconds" --fast --fps 12 --preview-every 2
+!python main.py "a 480p sunset timelapse, 10 seconds" --fast --fps 12 --preview-every 2

@@ -31,6 +31,16 @@ no classifier-free guidance, which is the only configuration that produces tens 
 seconds of video on 2× T4 in roughly a minute. Guidance 1.0 halves the batch; the
 LTX VAE's 32×/8× compression cuts the token count ~5× against CogVideoX.
 
+Resume / cache
+--------------
+Every finished pass is written losslessly to `<cache_root>/<run_key>/pass_XX.npz`,
+keyed by a `cache.RunSignature` of the whole run (prompt, model, resolution, fps, steps,
+guidance, seed, duration, per-pass frame counts). Re-running the same command after
+an OOM, a Kaggle timeout or a Ctrl-C reuses those passes instead of regenerating
+them, and the text embeddings are cached too (one T5 forward per run, not per pass).
+Behaviour that changes the output lands on a different key, so two configurations can
+never splice into one file. Checkpoint granularity is one pass — see cache.py.
+
 Live output
 -----------
 `stream=True` splits a long clip into several generation passes and writes + shows
@@ -59,6 +69,8 @@ from typing import Any
 import numpy as np
 import torch
 from PIL import Image
+
+from cache import RunCache, RunSignature, default_cache_root
 
 
 # ── Resolution presets ────────────────────────────────────────────────────────
@@ -419,6 +431,84 @@ def _model_default(model_info: dict, key: str, fallback: Any) -> Any:
     return fallback if value is None else value
 
 
+# ── Prompt embeddings (encoded once, reused by every pass/resume) ─────────────
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    oom = getattr(torch.cuda, "OutOfMemoryError", None)
+    return (oom is not None and isinstance(exc, oom)) or "out of memory" in str(exc).lower()
+
+
+def _place_embeds(pipe: Any, positive: Any, negative: Any) -> dict:
+    """Return embeddings on the dtype/device the transformer will be called with."""
+    try:
+        dtype  = getattr(getattr(pipe, "transformer", None), "dtype", None)
+        device = getattr(pipe, "_execution_device", None)
+        if dtype is not None:
+            positive = positive.to(dtype=dtype)
+            negative = None if negative is None else negative.to(dtype=dtype)
+        if device is not None:
+            positive = positive.to(device=device)
+            negative = None if negative is None else negative.to(device=device)
+    except Exception:                                       # noqa: BLE001
+        pass
+    return {"positive": positive, "negative": negative}
+
+
+def _prepare_embeds(
+    pipe: Any,
+    cache: RunCache,
+    prompt: str,
+    negative: str,
+    guidance_scale: float,
+) -> dict | None:
+    """Encode the prompt once (or load it from cache) for every pass to reuse.
+
+    Text encoding is identical for every pass of a run, so doing it once saves a T5
+    forward per pass — noticeable on the fast path, where a whole clip is only a few
+    passes. Returns a mutable dict (so a rejected batch can be cleared for the rest of
+    the run) or None to let the pipeline encode as usual.
+    """
+    cached = cache.load_embeds()
+    if cached is not None:
+        positive, negative_embeds = cached
+        if negative_embeds is None and guidance_scale > 1.0:
+            print("[cache] Cached embeddings lack the negative half CFG needs "
+                  "— re-encoding")
+        else:
+            return _place_embeds(pipe, positive, negative_embeds)
+
+    encoder = getattr(pipe, "encode_prompt", None)
+    if not callable(encoder):
+        return None
+
+    try:
+        import inspect
+        params = inspect.signature(encoder).parameters
+        kwargs: dict[str, Any] = {}
+        if "do_classifier_free_guidance" in params:
+            kwargs["do_classifier_free_guidance"] = guidance_scale > 1.0
+        if "num_videos_per_prompt" in params:
+            kwargs["num_videos_per_prompt"] = 1
+        if "device" in params:
+            kwargs["device"] = getattr(pipe, "_execution_device", None) or pipe.device
+
+        with torch.inference_mode():
+            result = encoder(prompt=prompt, negative_prompt=negative, **kwargs)
+    except Exception as exc:                                # noqa: BLE001
+        print(f"[gen] Prompt-embedding reuse unavailable "
+              f"({type(exc).__name__}: {exc}) — using the pipeline's own encoding")
+        return None
+
+    if not isinstance(result, (tuple, list)) or len(result) < 2:
+        return None
+    positive, negative_embeds = result[0], result[1]
+    if positive is None or (negative_embeds is None and guidance_scale > 1.0):
+        return None
+
+    cache.save_embeds(positive, negative_embeds)
+    return _place_embeds(pipe, positive, negative_embeds)
+
+
 # ── Core generation ───────────────────────────────────────────────────────────
 
 def generate_video(
@@ -436,6 +526,8 @@ def generate_video(
     stream: bool = False,
     preview_every: int = 0,
     segment_seconds: float | None = None,
+    cache_dir: str | Path | None = None,
+    resume: bool = True,
 ) -> Path:
     """Run the generation pipeline and write an MP4.
 
@@ -455,6 +547,8 @@ def generate_video(
     stream              : save + show each pass as soon as it finishes
     preview_every       : decode a live preview still every N steps (0 → off)
     segment_seconds     : cap a single pass to this many seconds of footage
+    cache_dir           : where finished passes are kept (None → env/cwd default)
+    resume              : reuse passes from an identical earlier run when present
     """
     device        = hw_cfg["device"]
     model_id      = (model_info.get("model_id")
@@ -553,6 +647,23 @@ def generate_video(
     preview_hook    = (_make_preview_hook(pipe, preview_every, out_dir)
                        if preview_every > 0 else None)
 
+    # ── Resume cache + text embeddings ────────────────────────────────────
+    signature = RunSignature(
+        prompt=enhanced_prompt,
+        negative=negative,
+        model_id=model_id,
+        resolution=resolution,
+        fps=fps,
+        steps=num_inference_steps,
+        guidance=guidance_scale,
+        seed=seed,
+        duration_sec=duration_sec,
+        segment_sizes=tuple(segment_sizes),
+    )
+    cache  = RunCache(default_cache_root(cache_dir), signature, enabled=resume)
+    cache.register()
+    embeds = _prepare_embeds(pipe, cache, enhanced_prompt, negative, guidance_scale)
+
     print(f"[gen] Prompt      : {enhanced_prompt[:80]}{'…' if len(enhanced_prompt) > 80 else ''}")
     print(f"[gen] Resolution  : {width}×{height}  ({resolution}p)")
     print(f"[gen] Generate    : {generated_total} frames in {len(segment_sizes)} pass(es) "
@@ -565,41 +676,59 @@ def generate_video(
               f"({SEGMENT_FADE}-frame dissolve at each boundary)")
     if preview_hook is not None:
         print(f"[gen] Live preview: one decoded frame every {preview_every} steps")
+    print(cache.describe())
     print()
+
+    if cache.is_complete(len(segment_sizes)) and output_path.exists():
+        print(f"[gen] Already complete — all {len(segment_sizes)} pass(es) are cached and "
+              f"{output_path.name} exists. Nothing to generate.\n"
+              f"      (--clear-cache to start over.)")
+        _show_video(output_path)
+        return output_path
 
     # ── Generate pass by pass; show each one as it lands ─────────────────
     pil_frames: list[Image.Image] = []
     for index, seg_target in enumerate(segment_sizes, start=1):
-        if len(segment_sizes) > 1:
-            print(f"\n[gen] ── Pass {index}/{len(segment_sizes)}: {seg_target} frames ──")
-            if generator is not None:
-                # A fixed seed would make every pass byte-identical; offset per pass
-                # so the clip is reproducible yet actually moves.
-                generator.manual_seed(seed + index - 1)
+        seg_frames = cache.load_pass(index)          # None → must generate this one
 
-        t_pass = time.time()
-        output = _run_with_oom_recovery(
-            pipe=pipe,
-            model_id=model_id,
-            hw_cfg=hw_cfg,
-            enhanced_prompt=enhanced_prompt,
-            negative=negative,
-            total_frames=seg_target,
-            height=height,
-            width=width,
-            resolution=resolution,
-            fps=fps,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            generator=generator,
-            callback=preview_hook,
-        )
+        if seg_frames is None:
+            if len(segment_sizes) > 1:
+                print(f"\n[gen] ── Pass {index}/{len(segment_sizes)}: {seg_target} frames ──")
+                if generator is not None:
+                    # A fixed seed would make every pass byte-identical; offset per
+                    # pass so the clip is reproducible yet actually moves.
+                    generator.manual_seed(seed + index - 1)
 
-        elapsed     = time.time() - t_pass
-        frames_used = output["frames_used"]
-        print(f"\n[gen] Pass {index} done in {elapsed:.1f}s  ({elapsed/frames_used:.2f}s/frame)")
+            t_pass = time.time()
+            try:
+                output = _run_with_oom_recovery(
+                    pipe=pipe,
+                    model_id=model_id,
+                    hw_cfg=hw_cfg,
+                    enhanced_prompt=enhanced_prompt,
+                    negative=negative,
+                    total_frames=seg_target,
+                    height=height,
+                    width=width,
+                    resolution=resolution,
+                    fps=fps,
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=guidance_scale,
+                    generator=generator,
+                    callback=preview_hook,
+                    embeds=embeds,
+                )
+            except BaseException as exc:            # includes Ctrl-C / Kaggle timeout
+                cache.report_interrupted(index, len(segment_sizes), exc)
+                raise
 
-        seg_frames = _extract_frames(output["result"])
+            elapsed     = time.time() - t_pass
+            frames_used = output["frames_used"]
+            print(f"\n[gen] Pass {index} done in {elapsed:.1f}s  "
+                  f"({elapsed/frames_used:.2f}s/frame)")
+
+            seg_frames = _extract_frames(output["result"])
+            cache.save_pass(index, seg_frames)
 
         if stream and len(segment_sizes) > 1:
             part_path = out_dir / f"{output_path.stem}_part{index:02d}.mp4"
@@ -616,6 +745,7 @@ def generate_video(
               f"({len(pil_frames) / fps:.1f}s @ {fps} fps, blend interpolation)")
 
     _write_mp4(pil_frames, output_path, fps)
+    cache.mark_complete(output_path)
     print(f"[gen] Saved → {output_path.resolve()}")
     _show_video(output_path)
     return output_path
@@ -625,7 +755,7 @@ def generate_video(
 
 def _run_pipeline(pipe, model_id, enhanced_prompt, negative, total_frames,
                   height, width, num_inference_steps, guidance_scale, generator,
-                  callback=None):
+                  callback=None, embeds=None):
     """Single pipeline call — shared by both CogVideoX and LTX."""
     kwargs = dict(
         prompt=enhanced_prompt,
@@ -640,8 +770,28 @@ def _run_pipeline(pipe, model_id, enhanced_prompt, negative, total_frames,
     if callback is not None:
         kwargs["callback_on_step_end"] = callback
 
+    using_embeds = bool(embeds and embeds.get("positive") is not None)
+    if using_embeds:
+        kwargs["prompt_embeds"] = embeds["positive"]
+        if embeds.get("negative") is not None:
+            kwargs["negative_prompt_embeds"] = embeds["negative"]
+
     with torch.inference_mode():
-        return pipe(**kwargs)
+        try:
+            return pipe(**kwargs)
+        except (TypeError, RuntimeError) as exc:
+            # Cached embeddings can be rejected (unsupported kwarg, device or dtype
+            # mismatch). Drop them for the whole run and let the pipeline encode
+            # normally — but never swallow an OOM, that is the OOM handler's job.
+            if not using_embeds or _is_cuda_oom(exc):
+                raise
+            print(f"[gen] Cached prompt embeddings rejected "
+                  f"({type(exc).__name__}) — falling back to the pipeline's encoding")
+            if embeds is not None:
+                embeds.clear()
+            kwargs.pop("prompt_embeds", None)
+            kwargs.pop("negative_prompt_embeds", None)
+            return pipe(**kwargs)
 
 
 def _run_with_oom_recovery(
@@ -650,6 +800,7 @@ def _run_with_oom_recovery(
     total_frames, height, width, resolution, fps,
     num_inference_steps, guidance_scale, generator,
     callback=None,
+    embeds=None,
 ) -> dict:
     """Run pipeline and auto-retry with reduced params on CUDA OOM.
 
@@ -667,6 +818,7 @@ def _run_with_oom_recovery(
             total_frames, height, width,
             num_inference_steps, guidance_scale, generator,
             callback=callback,
+            embeds=embeds,
         )
         return {"result": result, "frames_used": total_frames, "t0": t0}
 
@@ -698,6 +850,7 @@ def _run_with_oom_recovery(
             new_frames, new_h, new_w,
             num_inference_steps, guidance_scale, generator,
             callback=callback,
+            embeds=embeds,
         )
         return {"result": result, "frames_used": new_frames, "t0": t0}
 
