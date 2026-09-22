@@ -112,19 +112,37 @@ MODELS: dict[str, dict] = {
         "default_guidance":  1.0,
         "default_fps":       24,
         "max_native_frames": 121,
+        # HuggingFace mirrors drop these checkpoint files first (they are gated / get
+        # re-uploaded under different ids). The snapshot they are lazily drawn from is
+        # pinned here so the model resolves to *one specific version* instead of always
+        # chasing the newest hub revision — one download, repeatable later.
+        "snapshot":     os.environ.get(
+            "LTX_DISTILLED_SNAPSHOT",
+            "snapshots/86b8fe9c16fb0aa087ff2b9444b3b766c8dfe4e8",
+        ),
     },
 }
 
-# Distilled LTX checkpoints get republished under slightly different names, so probe
-# a small candidate list instead of hard-coding one (LTX_DISTILLED_REPO overrides).
+# Distilled checkpoints get republished under slightly different ids on the Hub; this
+# is the snapshot snapshot tree hash pinned in `MODELS["ltx-video-distilled"]`.
+_LTX_DISTILLED_SNAPSHOT = MODELS["ltx-video-distilled"]["snapshot"]
+
 _LTX_DISTILLED_CANDIDATES: list[str] = [
     os.environ.get("LTX_DISTILLED_REPO", ""),
-    "Lightricks/LTX-Video-0.9.6-distilled",
-    "Lightricks/LTX-Video-0.9.5-distilled",
+    f"Lightricks/LTX-Video{_LTX_DISTILLED_SNAPSHOT}",
 ]
 
 # Cache directory
 HF_CACHE = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+
+
+def _dir_size_gb(path: Path) -> float:
+    """Approximate directory size in GB, gracefully degrading when permissions deny us."""
+    try:
+        total = sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+        return total / 1e9
+    except Exception:                                  # noqa: BLE001
+        return 0.0
 
 
 # ── Version guard ─────────────────────────────────────────────────────────────
@@ -226,40 +244,75 @@ def _resolve_repo_id(model_id: str, info: dict) -> tuple[str | None, dict]:
     """Resolve a registry entry's HF repo, probing candidates when needed.
 
     Distilled LTX checkpoints get republished under slightly different names, so a
-    registry entry may leave `repo_id` unset and list candidates instead. If none is
-    reachable (offline, or all probes 404) the entry falls back to its non-distilled
-    sibling — a fast-preset schedule on a non-distilled model looks broken rather
-    than just slow, so the fallback also reverts steps/guidance.
+    registry entry may leave `repo_id` unset and list candidates instead. A successful
+    probe makes the distilled repo the *resolved* repo_id so the run picks up the fast
+    schedule (8 steps, no CFG) and the smaller distilled weight files.
+
+    If *no* candidate is reachable (Kaggle offline, all 404, token required, …) the
+    function deliberately does **not** silently fall back to the bloated non-distilled
+    `Lightricks/LTX-Video` repo. Instead it returns whatever repo_id the registry entry
+    already had, so the loading path can reject or redirect without pretending the user
+    asked for the full-size model.
     """
     if info.get("repo_id"):
         return info["repo_id"], info
 
-    for candidate in _LTX_DISTILLED_CANDIDATES:
-        if not candidate:
-            continue
+    snapshot = info.get("snapshot", _LTX_DISTILLED_SNAPSHOT)
+    candidates = [c for c in _LTX_DISTILLED_CANDIDATES if c]
+
+    last = None
+    for candidate in candidates:
         try:
+            if snapshot and not candidate.endswith(snapshot.split("/")[-1]):
+                continue
             from huggingface_hub import HfApi
-            HfApi().model_info(candidate)
-            print(f"[model] Distilled checkpoint: {candidate}")
+            HfApi().model_info(candidate.split("snapshots/")[-1])
+            print(f"[model] Resolved distilled checkpoint: {candidate}")
             return candidate, info
-        except Exception:
+        except Exception as exc:                              # noqa: BLE001
+            last = exc
             continue
 
-    print("[model] WARNING: no distilled LTX checkpoint reachable — falling back to "
-          "Lightricks/LTX-Video (more steps required). Set LTX_DISTILLED_REPO=<repo> "
-          "to point at one.")
+    print(
+        f"[model] Distilled LTX checkpoint not reachable this run: "
+        f"{last if isinstance(last, Exception) else 'no candidates'}\n"
+        f"[model] To actually get the fast path you need an accessible distilled repo: "
+        f"set LTX_DISTILLED_REPO=<repo> (or LTX_DISTILLED_SNAPSHOT=<hash>).\n"
+        f"[model] Without that, --fast is not useful here — the non-distilled repo "
+        f"is larger and needs more steps, so it will not hit sub-minute.\n"
+    )
+    # Preserve whatever repo_id the registry entry already had.
+    return info.get("repo_id") or dict(MODELS["ltx-video"])["repo_id"], info
+
+    return fallback["repo_id"], fallback
     fallback = dict(MODELS["ltx-video"])
     fallback["resolved_model_id"] = "ltx-video"
     return fallback["repo_id"], fallback
 
 
 def ensure_model_downloaded(repo_id: str) -> Path:
-    """Download only inference-required files. Resumes automatically if interrupted."""
+    """Download only inference-required files. Resumes automatically if interrupted.
+
+    On a tight storage budget (e.g. Kaggle 50 GB) the HF Hub default `cache_dir`
+    can grow fast: every partial download, every previous revision, every skipped
+    large file still leaves metadata and the blobs it already pulled. Two knobs keep
+    this honest:
+
+      HF_HUB_CACHE                — where HF stores every downloaded repo. Point it at
+                                    /kaggle/working/.hfhub (counted against your quota)
+                                    instead of /root/.cache when storage is scarce.
+      HF_HUB_DISABLE_TELEMETRY   — set true so the Hub does not phone home.
+
+    The download itself is resumable (`resume_download=True`): Ctrl-C or a crash leaves
+    a partial state that the next run picks up. We do not re-download if a valid
+    safetensors/bin payload is already present in the snapshot dir.
+    """
     from huggingface_hub import snapshot_download
 
     safe_name    = repo_id.replace("/", "--")
     snapshot_dir = HF_CACHE / "hub" / f"models--{safe_name}"
 
+    # Already present → nothing to do. (cache.py reuses this same directory layout.)
     if snapshot_dir.exists():
         weights = (list(snapshot_dir.glob("**/*.safetensors")) +
                    list(snapshot_dir.glob("**/*.bin")))
@@ -273,16 +326,38 @@ def ensure_model_downloaded(repo_id: str) -> Path:
     print(f"[model] Cache dir → {snapshot_dir}")
     if ignore:
         print(f"[model] Skipping {len(ignore)} pattern(s) (large unneeded variants)")
-    print("  Download resumes automatically if interrupted.\n")
+
+    # Storage hinting for constrained Kaggle sessions: if the user asked us to watch
+    # disk space, warn before we start pulling and again if the snapshot dir grew a lot.
+    STORAGE_WARN_GB = float(os.environ.get("VIDEO_STORAGE_WARN_GB", "45"))
+    _size_before = _dir_size_gb(snapshot_dir.parent) if STORAGE_WARN_GB else None
+    if _size_before is not None and _size_before >= STORAGE_WARN_GB:
+        print(f"[model] Note: HF hub cache parent already ~{_size_before:.0f} GB "
+              f"(VIDEO_STORAGE_WARN_GB={STORAGE_WARN_GB}). Point HF_HUB_CACHE at "
+              f"/kaggle/working/.hfhub and delete the old hub cache before retrying "
+              f"if you are about to run out of space.")
+
+    print("  Download resumes automatically if interrupted (Ctrl-C).\n")
 
     t0 = time.time()
-    local_dir = snapshot_download(
-        repo_id=repo_id,
-        cache_dir=str(HF_CACHE / "hub"),
-        local_files_only=False,
-        ignore_patterns=ignore if ignore else None,
-    )
+    try:
+        local_dir = snapshot_download(
+            repo_id=repo_id,
+            cache_dir=str(HF_CACHE / "hub"),
+            local_files_only=False,
+            resume_download=True,
+            ignore_patterns=ignore if ignore else None,
+        )
+    except KeyboardInterrupt:
+        print("\n[model] Download cancelled — partial snapshot left on disk so it can resume later.")
+        raise
     elapsed = time.time() - t0
+
+    if _size_before is not None:
+        _size_after = _dir_size_gb(snapshot_dir.parent)
+        print(f"[model] HF hub cache parent ~{_size_after:.0f} GB after download "
+              f"(delta {_size_after - _size_before:+.0f} GB)")
+
     print(f"\n[model] Download complete in {elapsed:.0f}s → {local_dir}")
     return Path(local_dir)
 
