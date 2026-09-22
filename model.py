@@ -103,24 +103,31 @@ def _check_version_for_model(model_id: str) -> None:
 def select_model(hw_cfg: dict) -> str:
     """Choose the best model for the detected hardware.
 
-    Uses total_vram_gb (sum across all GPUs) so that e.g. 2× T4 = 31 GB
-    correctly unlocks cogvideox-5b.
+    Key insight: CogVideoX-5b's 3D attention materialises QKᵀ matrices that
+    are O(T×H×W)² in size. On T4-class GPUs (15 GB each) this OOMs during the
+    forward pass regardless of how many GPUs hold the weights.
 
-    VRAM budgets (bfloat16):
-      cogvideox-5b  ~18 GB   — safe when total_vram_gb >= 18
-      cogvideox-2b  ~10 GB   — safe when total_vram_gb >= 10
-      ltx-video     ~6 GB    — everything else, CPU, MPS
+    Safe model choices per GPU tier:
+      Single GPU  ≥ 24 GB  (A100/H100)  → cogvideox-5b  (weights + activations fit)
+      Multi-GPU   any config             → cogvideox-2b  (lighter attention, safe)
+      Single GPU  10–23 GB              → cogvideox-2b
+      < 10 GB / CPU / MPS               → ltx-video
     """
     device     = hw_cfg["device"]
-    total_vram = hw_cfg.get("total_vram_gb", hw_cfg.get("vram_gb", 0))
+    vram_gb    = hw_cfg.get("vram_gb", 0)        # single GPU VRAM
+    gpu_count  = hw_cfg.get("gpu_count", 1)
 
     if device in ("cpu", "mps") or not _HAS_COGVIDEOX:
         return "ltx-video"
 
-    if total_vram >= 18:
+    # cogvideox-5b only safe on a single high-VRAM GPU (≥24 GB) where
+    # both weights (~17 GB) AND attention activations (~6 GB+) fit together
+    if gpu_count == 1 and vram_gb >= 24:
         return "cogvideox-5b"
-    if total_vram >= 10:
+
+    if vram_gb >= 10:
         return "cogvideox-2b"
+
     return "ltx-video"
 
 
@@ -194,76 +201,72 @@ def ensure_model_downloaded(repo_id: str) -> Path:
 # ── Pipeline loading ──────────────────────────────────────────────────────────
 
 def _load_pipeline(repo_id: str, pipeline_cls: Any, hw_cfg: dict) -> Any:
-    """Load pipeline with device_map="auto" (multi-GPU) or plain dtype load (single)."""
-    dtype          = hw_cfg["dtype"]
-    use_device_map = hw_cfg.get("use_device_map", False)
-    gpu_count      = hw_cfg.get("gpu_count", 1)
-    loader         = pipeline_cls if pipeline_cls is not None else DiffusionPipeline
-    cls_name       = loader.__name__ if loader else "DiffusionPipeline"
+    """Load pipeline from cache.
 
-    if use_device_map:
-        print(f"[model] Loading {cls_name} ({dtype}) across {gpu_count} GPUs "
-              f"with device_map='balanced' …")
-        pipe = loader.from_pretrained(
-            repo_id,
-            torch_dtype=dtype,
-            cache_dir=str(HF_CACHE / "hub"),
-            device_map="balanced",      # diffusers: splits layers evenly across GPUs
-        )
-    else:
-        print(f"[model] Loading {cls_name} ({dtype}) …")
-        pipe = loader.from_pretrained(
-            repo_id,
-            torch_dtype=dtype,
-            cache_dir=str(HF_CACHE / "hub"),
-        )
+    device_map="balanced" splits weights but NOT attention activations —
+    on T4-class GPUs cogvideox-5b's QKᵀ attention matrices still OOM on a
+    single GPU during the forward pass. So we always load with plain
+    from_pretrained() and let _apply_optimisations handle placement.
+    """
+    dtype    = hw_cfg["dtype"]
+    loader   = pipeline_cls if pipeline_cls is not None else DiffusionPipeline
+    cls_name = loader.__name__ if loader else "DiffusionPipeline"
 
+    print(f"[model] Loading {cls_name} ({dtype}) …")
+    pipe = loader.from_pretrained(
+        repo_id,
+        torch_dtype=dtype,
+        cache_dir=str(HF_CACHE / "hub"),
+    )
     return pipe
 
 
 def _apply_optimisations(pipe: Any, hw_cfg: dict, model_id: str) -> Any:
     """Apply memory / speed optimisations and return the pipeline.
 
-    Multi-GPU path (use_device_map=True):
-        device_map="auto" already placed all tensors — skip .to() and offload
-        calls entirely. Only add attention/VAE slicing.
-
-    Single-GPU path — three tiers by VRAM:
-        Tier 1 (>= full_vram GB) : .to("cuda")
-        Tier 2 (>= min_vram GB)  : enable_model_cpu_offload()
-        Tier 3 (< min_vram GB)   : enable_sequential_cpu_offload()
+    Strategy by hardware:
+      Single GPU ≥ full_vram GB   → .to("cuda")  (fastest)
+      Single GPU ≥ min_vram GB    → enable_model_cpu_offload()
+      Single GPU < min_vram GB    → enable_sequential_cpu_offload()
+      Multi-GPU (any config)      → enable_model_cpu_offload(gpu_id=0)
+                                    Offload executes each sub-module on GPU 0,
+                                    keeping only one layer's weights+activations
+                                    in VRAM at a time — avoids the attention OOM.
+      CPU                         → enable_sequential_cpu_offload()
     """
-    device         = hw_cfg["device"]
-    vram_gb        = hw_cfg.get("vram_gb", 0)
-    total_vram_gb  = hw_cfg.get("total_vram_gb", vram_gb)
-    use_device_map = hw_cfg.get("use_device_map", False)
+    device    = hw_cfg["device"]
+    vram_gb   = hw_cfg.get("vram_gb", 0)
+    gpu_count = hw_cfg.get("gpu_count", 1)
 
-    # Per-model VRAM thresholds (bfloat16, approximate)
-    _FULL_VRAM = {"cogvideox-5b": 18, "cogvideox-2b": 12, "ltx-video": 8}
-    _MIN_VRAM  = {"cogvideox-5b": 14, "cogvideox-2b":  8, "ltx-video": 5}
+    _FULL_VRAM = {"cogvideox-5b": 24, "cogvideox-2b": 12, "ltx-video": 8}
+    _MIN_VRAM  = {"cogvideox-5b": 16, "cogvideox-2b":  8, "ltx-video": 5}
 
-    mid      = model_id.lower()
-    key      = next((k for k in _FULL_VRAM if k in mid), None)
+    mid       = model_id.lower()
+    key       = next((k for k in _FULL_VRAM if k in mid), None)
     full_vram = _FULL_VRAM.get(key, 12)
     min_vram  = _MIN_VRAM.get(key, 8)
 
     if device == "cuda":
-        if use_device_map:
-            # Model is already distributed across GPUs by device_map="balanced" — nothing to move
-            print(f"[model] Multi-GPU: model balanced across {hw_cfg['gpu_count']} GPUs "
-                  f"({total_vram_gb:.0f} GB total VRAM)")
+        if gpu_count > 1:
+            # Multi-GPU: use model_cpu_offload on GPU 0.
+            # This streams one sub-module at a time through GPU 0 —
+            # weights live in CPU RAM between uses, activations never
+            # accumulate across layers, attention OOM is impossible.
+            print(
+                f"[model] Multi-GPU ({gpu_count}× GPU, {hw_cfg.get('total_vram_gb', 0):.0f} GB): "
+                f"using model_cpu_offload on GPU 0 to prevent attention OOM"
+            )
+            pipe.enable_model_cpu_offload(gpu_id=0)
         elif vram_gb >= full_vram:
-            print(f"[model] {vram_gb:.0f} GB VRAM ≥ {full_vram} GB — loading fully onto GPU")
+            print(f"[model] {vram_gb:.0f} GB VRAM — loading fully onto GPU")
             pipe = pipe.to(device)
         elif vram_gb >= min_vram:
-            print(f"[model] {vram_gb:.0f} GB VRAM — using model CPU offload "
-                  f"(need {full_vram} GB for full GPU)")
+            print(f"[model] {vram_gb:.0f} GB VRAM — using model CPU offload")
             pipe.enable_model_cpu_offload()
         else:
             print(f"[model] {vram_gb:.0f} GB VRAM — using sequential CPU offload")
             pipe.enable_sequential_cpu_offload()
 
-        # Attention / VAE slicing: safe with all placement strategies
         if hasattr(pipe, "enable_attention_slicing"):
             pipe.enable_attention_slicing()
         if hasattr(pipe, "enable_vae_slicing"):
@@ -277,12 +280,11 @@ def _apply_optimisations(pipe: Any, hw_cfg: dict, model_id: str) -> Any:
     else:  # CPU
         pipe.enable_sequential_cpu_offload()
 
-    # torch.compile — only when model is fully on a single GPU
-    # device_map="auto" and torch.compile conflict (different dispatch mechanisms)
+    # torch.compile only when fully resident on a single GPU
     compile_ok = (
         hw_cfg.get("use_compile")
         and device == "cuda"
-        and not use_device_map
+        and gpu_count == 1
         and vram_gb >= full_vram
     )
     if compile_ok:
@@ -291,9 +293,7 @@ def _apply_optimisations(pipe: Any, hw_cfg: dict, model_id: str) -> Any:
             try:
                 print("[model] Compiling transformer with torch.compile …")
                 pipe.transformer = torch.compile(
-                    transformer,
-                    mode="reduce-overhead",
-                    fullgraph=False,
+                    transformer, mode="reduce-overhead", fullgraph=False,
                 )
             except Exception as exc:
                 print(f"[model] torch.compile skipped: {exc}")

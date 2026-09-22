@@ -151,14 +151,17 @@ def print_device_summary(cfg: dict) -> None:
     print(f"  Device            : {cfg['device'].upper()}")
     print(f"  Dtype             : {cfg['dtype']}")
     if cfg.get("gpu_count", 0) > 1:
-        print(f"  GPUs              : {cfg['gpu_count']}× (total {cfg['total_vram_gb']:.1f} GB VRAM)")
+        print(f"  GPUs              : {cfg['gpu_count']}× "
+              f"(total {cfg['total_vram_gb']:.1f} GB VRAM, "
+              f"{cfg['vram_gb']:.1f} GB each)")
+        print(f"  Offload strategy  : model_cpu_offload on GPU 0 "
+              f"(prevents attention OOM on multi-T4)")
     elif cfg.get("vram_gb"):
         print(f"  VRAM              : {cfg['vram_gb']:.1f} GB")
     if cfg.get("threads"):
         print(f"  CPU threads       : {cfg['threads']}")
     print(f"  Max resolution    : {cfg['max_resolution']}p")
     print(f"  Max model size    : {cfg['max_model_size']}")
-    print(f"  Multi-GPU sharding: {'yes (device_map=auto)' if cfg.get('use_device_map') else 'no'}")
     print(f"  torch.compile     : {'yes' if cfg['use_compile'] else 'no'}")
     print(f"  Sequential offload: {'yes' if cfg['sequential_offload'] else 'no'}")
     print("────────────────────────────────────────────────────────\n")
