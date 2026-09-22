@@ -781,6 +781,20 @@ def _run_pipeline(pipe, model_id, enhanced_prompt, negative, total_frames,
         # Pipeline rejects having both prompt text and prompt_embeds at once
         kwargs.pop("prompt", None)
         kwargs.pop("negative_prompt", None)
+        # LTXPipeline requires an explicit prompt_attention_mask alongside the
+        # cached prompt_embeds (it cannot re-derive it from the dropped text).
+        if "prompt_attention_mask" not in kwargs:
+            kwargs["prompt_attention_mask"] = torch.ones(
+                1, dtype=torch.long,
+                device=(kwargs["generator"].device
+                        if hasattr(kwargs.get("generator"), "device")
+                        else getattr(pipe, "_execution_device", None)
+                        or torch.device("cpu")),
+            )
+        if "negative_prompt_attention_mask" not in kwargs and embeds.get("negative") is not None:
+            kwargs["negative_prompt_attention_mask"] = torch.ones(
+                1, dtype=torch.long, device=kwargs["prompt_attention_mask"].device,
+            )
 
     with torch.inference_mode():
         try:
