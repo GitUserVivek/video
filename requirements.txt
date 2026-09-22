@@ -10,26 +10,36 @@
 #   CUDA 12.1+  →  pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cu121
 #   ROCm 6.0    →  pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/rocm6.0
 #   CPU only    →  pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cpu
+#
+# Dependency compatibility notes:
+#   - diffusers >= 0.32.0  requires huggingface-hub >= 1.0
+#   - transformers < 4.47  requires huggingface-hub < 1.0  ← CONFLICT
+#   - transformers >= 4.47 dropped the <1.0 upper bound   ← RESOLVED
+#   - tokenizers >= 0.21.0 is required by transformers >= 4.47
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Diffusion / model stack ──────────────────────────────────────────────────
-diffusers==0.30.3
-transformers==4.44.2
-accelerate==0.34.2
-safetensors==0.4.4
-sentencepiece==0.2.0
-tokenizers==0.19.1
+diffusers>=0.32.0
+# transformers >= 4.47 dropped huggingface-hub<1.0 cap — required for diffusers 0.32+
+transformers>=4.47.0
+accelerate>=0.34.2
+safetensors>=0.4.4
+sentencepiece>=0.2.0
+tokenizers>=0.21.0
 
-# ── HuggingFace Hub (model download with resume) ─────────────────────────────
-huggingface_hub==0.24.6
+# ── HuggingFace Hub ───────────────────────────────────────────────────────────
+huggingface_hub>=1.0.0
+
+# ── Version checking ─────────────────────────────────────────────────────────
+packaging>=24.0
 
 # ── Video / image I/O ────────────────────────────────────────────────────────
-imageio==2.35.1
-imageio-ffmpeg==0.5.1      # bundles static ffmpeg binary — no system ffmpeg needed
-Pillow==10.4.0
-numpy==1.26.4
-opencv-python-headless==4.10.0.84   # headless: no GUI deps
+imageio>=2.35.1
+imageio-ffmpeg>=0.5.1      # bundles static ffmpeg binary — no system ffmpeg needed
+Pillow>=10.4.0
+numpy>=1.26.4
+opencv-python-headless>=4.10.0.84
 
 # ── Optional quality-of-life ─────────────────────────────────────────────────
-psutil==6.0.0              # better CPU/RAM info in hardware.py
-tqdm==4.66.5               # progress bars used by huggingface_hub
+psutil>=6.0.0
+tqdm>=4.66.5

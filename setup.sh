@@ -105,7 +105,11 @@ pip install \
     --quiet
 
 # ── Install remaining dependencies ────────────────────────────────────────────
+# Install packaging first — model.py uses it for version checks at import time
+pip install "packaging>=24.0" --quiet
+
 info "Installing remaining dependencies from requirements.txt …"
+# diffusers >= 0.32.0 required for LTXPipeline (added in that release)
 pip install -r requirements.txt --quiet
 
 # ── Verify install ────────────────────────────────────────────────────────────

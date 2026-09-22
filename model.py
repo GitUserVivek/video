@@ -3,16 +3,14 @@ model.py — Model registry, auto-download (with progress bar), and device-aware
 
 Supported model families
 ------------------------
-  CogVideoX  (THUDM/CogVideoX-2b, CogVideoX-5b)   – primary choice
-  LTX-Video  (Lightricks/LTX-Video)                – fast, low-VRAM
-  Open-Sora  (hpcai-tech/Open-Sora)                – research/CPU-friendly
+  CogVideoX  (THUDM/CogVideoX-2b, CogVideoX-5b)   – primary choice for GPU
+  LTX-Video  (Lightricks/LTX-Video)                – fast, low-VRAM / CPU
 
-Selection heuristic
--------------------
-  ≥16 GB VRAM  → CogVideoX-5b   (best quality)
-  ≥ 8 GB VRAM  → CogVideoX-2b
-  <  8 GB VRAM / MPS → LTX-Video (most compact)
-  CPU          → LTX-Video with sequential offload
+Diffusers version compatibility
+--------------------------------
+  CogVideoXPipeline  → diffusers >= 0.29.0
+  LTXPipeline        → diffusers >= 0.32.0
+  Fallback           → DiffusionPipeline.from_pretrained() works with any version
 """
 
 from __future__ import annotations
@@ -22,36 +20,56 @@ import time
 from pathlib import Path
 from typing import Any
 
+import diffusers
 import torch
-from diffusers import (
-    CogVideoXPipeline,
-    LTXPipeline,
-    LTXVideoTransformer3DModel,
-)
-from huggingface_hub import snapshot_download
-from transformers import T5EncoderModel
+from packaging.version import Version
+
+# ── Version-safe pipeline imports ─────────────────────────────────────────────
+
+_DIFFUSERS_VER = Version(diffusers.__version__)
+_HAS_COGVIDEOX = _DIFFUSERS_VER >= Version("0.29.0")
+_HAS_LTX       = _DIFFUSERS_VER >= Version("0.32.0")
+
+print(f"[model] diffusers {diffusers.__version__}  "
+      f"(CogVideoX={'✓' if _HAS_COGVIDEOX else '✗'}  "
+      f"LTX={'✓' if _HAS_LTX else '✗'})")
+
+if _HAS_COGVIDEOX:
+    from diffusers import CogVideoXPipeline
+else:
+    CogVideoXPipeline = None  # type: ignore[assignment,misc]
+
+if _HAS_LTX:
+    from diffusers import LTXPipeline
+else:
+    LTXPipeline = None  # type: ignore[assignment,misc]
+
+from diffusers import DiffusionPipeline  # always available
 
 
 # ── Model registry ────────────────────────────────────────────────────────────
 
 MODELS: dict[str, dict] = {
     "cogvideox-5b": {
-        "repo_id":    "THUDM/CogVideoX-5b",
-        "pipeline":   "CogVideoXPipeline",
-        "min_vram":   14,   # GB – can use with sequential offload at ~10 GB
-        "size_label": "5B",
+        "repo_id":      "THUDM/CogVideoX-5b",
+        "pipeline":     "CogVideoXPipeline",
+        "min_vram":     14,
+        "size_label":   "5B",
+        "requires_ver": "0.29.0",
     },
     "cogvideox-2b": {
-        "repo_id":    "THUDM/CogVideoX-2b",
-        "pipeline":   "CogVideoXPipeline",
-        "min_vram":   8,
-        "size_label": "2B",
+        "repo_id":      "THUDM/CogVideoX-2b",
+        "pipeline":     "CogVideoXPipeline",
+        "min_vram":     8,
+        "size_label":   "2B",
+        "requires_ver": "0.29.0",
     },
     "ltx-video": {
-        "repo_id":    "Lightricks/LTX-Video",
-        "pipeline":   "LTXPipeline",
-        "min_vram":   4,
-        "size_label": "~2B",
+        "repo_id":      "Lightricks/LTX-Video",
+        "pipeline":     "LTXPipeline",
+        "min_vram":     4,
+        "size_label":   "~2B",
+        "requires_ver": "0.32.0",
     },
 }
 
@@ -59,68 +77,113 @@ MODELS: dict[str, dict] = {
 HF_CACHE = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
 
 
+# ── Version guard ─────────────────────────────────────────────────────────────
+
+def _check_version_for_model(model_id: str) -> None:
+    """Raise a clear error if diffusers is too old for the requested model."""
+    required = MODELS[model_id].get("requires_ver", "0.0.0")
+    if _DIFFUSERS_VER < Version(required):
+        raise RuntimeError(
+            f"Model '{model_id}' requires diffusers >= {required} "
+            f"but {diffusers.__version__} is installed.\n\n"
+            f"Fix: pip install 'diffusers>={required}'\n"
+            f"  or: pip install --upgrade diffusers"
+        )
+
+
 # ── Model selection ───────────────────────────────────────────────────────────
 
 def select_model(hw_cfg: dict) -> str:
     """Choose the best model ID for the detected hardware."""
-    device   = hw_cfg["device"]
-    vram_gb  = hw_cfg.get("vram_gb", 0)
-    max_size = hw_cfg.get("max_model_size", "1.3B")
+    device  = hw_cfg["device"]
+    vram_gb = hw_cfg.get("vram_gb", 0)
 
-    if device == "cpu" or max_size == "1.3B":
+    # Always prefer LTX on CPU/MPS or when diffusers is too old for CogVideoX
+    if device in ("cpu", "mps") or not _HAS_COGVIDEOX:
         return "ltx-video"
 
-    if device in ("cuda", "mps"):
-        if vram_gb >= 14:
-            return "cogvideox-5b"
-        if vram_gb >= 8:
-            return "cogvideox-2b"
-        return "ltx-video"
-
-    return "ltx-video"   # safe fallback
+    if vram_gb >= 14:
+        return "cogvideox-5b"
+    if vram_gb >= 8:
+        return "cogvideox-2b"
+    return "ltx-video"
 
 
 # ── Download helpers ──────────────────────────────────────────────────────────
 
-def _progress_callback(downloaded: int, total: int, bar_width: int = 40) -> None:
-    """Simple ASCII progress bar printed to stdout."""
-    if total <= 0:
-        return
-    frac   = min(downloaded / total, 1.0)
-    filled = int(bar_width * frac)
-    bar    = "█" * filled + "░" * (bar_width - filled)
-    pct    = frac * 100
-    dl_gb  = downloaded / 1e9
-    tot_gb = total / 1e9
-    print(f"\r  [{bar}] {pct:5.1f}%  {dl_gb:.2f}/{tot_gb:.2f} GB", end="", flush=True)
+
+# Files to skip per repo — large extras that are NOT needed for text-to-video inference
+_IGNORE_PATTERNS: dict[str, list[str]] = {
+    "Lightricks/LTX-Video": [
+        # image-to-video variants (separate checkpoints, not needed for t2v)
+        "ltx-video-2b-v0.9-image-to-video*",
+        "ltx-video-2b-v0.9.1-image-to-video*",
+        "ltxv-13b-*",               # 13B variant — too large for CPU
+        # training / fine-tuning helpers
+        "training/*",
+        "finetrainers/*",
+        # GGUF quantised weights (we use bfloat16 safetensors directly)
+        "*.gguf",
+        # old numbered-shard bin files (superseded by safetensors)
+        "pytorch_model*.bin",
+        # large video samples bundled in the repo
+        "*.mp4",
+        "*.gif",
+    ],
+    "THUDM/CogVideoX-2b": [
+        "*.bin",          # safetensors are preferred
+        "*.msgpack",
+        "flax_model*",
+    ],
+    "THUDM/CogVideoX-5b": [
+        "*.bin",
+        "*.msgpack",
+        "flax_model*",
+    ],
+}
 
 
 def ensure_model_downloaded(repo_id: str) -> Path:
-    """Download model snapshot from HuggingFace if not already cached.
+    """Download only the inference-required files from HuggingFace.
 
-    Returns the local path to the snapshot directory.
-    Uses huggingface_hub snapshot_download which resumes partial downloads.
+    Uses snapshot_download() with ignore_patterns to skip large extras
+    (image-to-video checkpoints, training scripts, GGUF weights, etc.).
+    Downloads always resume if interrupted.
+    Returns the local snapshot directory path.
     """
-    safe_name = repo_id.replace("/", "--")
+    from huggingface_hub import snapshot_download
+
+    safe_name    = repo_id.replace("/", "--")
     snapshot_dir = HF_CACHE / "hub" / f"models--{safe_name}"
 
     if snapshot_dir.exists():
-        # Check for at least one .safetensors or .bin file
-        weights = list(snapshot_dir.glob("**/*.safetensors")) + \
-                  list(snapshot_dir.glob("**/*.bin"))
+        weights = (list(snapshot_dir.glob("**/*.safetensors")) +
+                   list(snapshot_dir.glob("**/*.bin")))
         if weights:
             print(f"[model] Cache hit: {repo_id}")
             return snapshot_dir
 
-    print(f"[model] Downloading {repo_id} → {snapshot_dir}")
-    print("  This may take several minutes on first run …")
+    ignore = _IGNORE_PATTERNS.get(repo_id, [])
+
+    # Estimate download size for the user
+    _SIZE_HINTS = {
+        "Lightricks/LTX-Video":  "~8 GB  (text-to-video weights only)",
+        "THUDM/CogVideoX-2b":    "~16 GB",
+        "THUDM/CogVideoX-5b":    "~30 GB",
+    }
+    size_hint = _SIZE_HINTS.get(repo_id, "")
+    print(f"[model] Downloading {repo_id}  {size_hint}")
+    print(f"[model] Cache dir → {snapshot_dir}")
+    if ignore:
+        print(f"[model] Skipping {len(ignore)} ignore pattern(s) to avoid large unneeded files")
+    print("  Download will resume automatically if interrupted.\n")
 
     t0 = time.time()
     local_dir = snapshot_download(
         repo_id=repo_id,
         cache_dir=str(HF_CACHE / "hub"),
         local_files_only=False,
-        resume_download=True,
+        ignore_patterns=ignore if ignore else None,
     )
     elapsed = time.time() - t0
     print(f"\n[model] Download complete in {elapsed:.0f}s → {local_dir}")
@@ -129,19 +192,11 @@ def ensure_model_downloaded(repo_id: str) -> Path:
 
 # ── Pipeline loading ──────────────────────────────────────────────────────────
 
-def _load_cogvideox(repo_id: str, hw_cfg: dict) -> Any:
-    """Load a CogVideoX pipeline with correct dtype and offloading strategy."""
-    device    = hw_cfg["device"]
-    dtype     = hw_cfg["dtype"]
-    offload   = hw_cfg["sequential_offload"]
-    vram_gb   = hw_cfg.get("vram_gb", 0)
-
-    print(f"[model] Loading CogVideoXPipeline ({dtype}) …")
-    pipe = CogVideoXPipeline.from_pretrained(
-        repo_id,
-        torch_dtype=dtype,
-        cache_dir=str(HF_CACHE / "hub"),
-    )
+def _apply_optimisations(pipe: Any, hw_cfg: dict, model_id: str) -> Any:
+    """Apply memory / speed optimisations in-place and return the pipeline."""
+    device  = hw_cfg["device"]
+    vram_gb = hw_cfg.get("vram_gb", 0)
+    offload = hw_cfg.get("sequential_offload", False)
 
     if device == "cuda":
         if offload or vram_gb < 10:
@@ -149,69 +204,51 @@ def _load_cogvideox(repo_id: str, hw_cfg: dict) -> Any:
             pipe.enable_sequential_cpu_offload()
         else:
             pipe = pipe.to(device)
-        # Slice attention to save VRAM
-        pipe.enable_attention_slicing()
-        if vram_gb >= 8:
+
+        # Attention / VAE slicing reduces peak VRAM with minimal quality loss
+        if hasattr(pipe, "enable_attention_slicing"):
+            pipe.enable_attention_slicing()
+        if hasattr(pipe, "enable_vae_slicing"):
             pipe.enable_vae_slicing()
+        if hasattr(pipe, "enable_vae_tiling"):
             pipe.enable_vae_tiling()
+
     elif device == "mps":
         pipe = pipe.to(device)
-    else:
-        # CPU: keep weights in RAM, use sequential offload
+
+    else:  # CPU
+        # sequential_cpu_offload on CPU just keeps peak RAM lower
         pipe.enable_sequential_cpu_offload()
 
+    # torch.compile — only the transformer, only on CUDA
     if hw_cfg.get("use_compile") and device == "cuda":
-        try:
-            print("[model] Compiling transformer with torch.compile …")
-            pipe.transformer = torch.compile(
-                pipe.transformer,
-                mode="reduce-overhead",
-                fullgraph=False,
-            )
-        except Exception as exc:
-            print(f"[model] torch.compile skipped: {exc}")
+        transformer = getattr(pipe, "transformer", None)
+        if transformer is not None:
+            try:
+                print("[model] Compiling transformer with torch.compile …")
+                pipe.transformer = torch.compile(
+                    transformer,
+                    mode="reduce-overhead",
+                    fullgraph=False,
+                )
+            except Exception as exc:
+                print(f"[model] torch.compile skipped: {exc}")
 
     return pipe
 
 
-def _load_ltx(repo_id: str, hw_cfg: dict) -> Any:
-    """Load an LTX-Video pipeline."""
-    device  = hw_cfg["device"]
-    dtype   = hw_cfg["dtype"]
-    offload = hw_cfg["sequential_offload"]
+def _load_pipeline(repo_id: str, pipeline_cls: Any, hw_cfg: dict) -> Any:
+    """Generic loader: from_pretrained → optimisations."""
+    dtype = hw_cfg["dtype"]
+    print(f"[model] Loading {pipeline_cls.__name__ if pipeline_cls else 'DiffusionPipeline'} "
+          f"({dtype}) …")
 
-    print(f"[model] Loading LTXPipeline ({dtype}) …")
-
-    # LTX uses a separate transformer + text encoder loading pattern
-    pipe = LTXPipeline.from_pretrained(
+    loader = pipeline_cls if pipeline_cls is not None else DiffusionPipeline
+    pipe   = loader.from_pretrained(
         repo_id,
         torch_dtype=dtype,
         cache_dir=str(HF_CACHE / "hub"),
     )
-
-    if device == "cuda":
-        if offload:
-            pipe.enable_sequential_cpu_offload()
-        else:
-            pipe = pipe.to(device)
-        pipe.enable_attention_slicing()
-        pipe.enable_vae_slicing()
-    elif device == "mps":
-        pipe = pipe.to(device)
-    else:
-        pipe.enable_sequential_cpu_offload()
-
-    if hw_cfg.get("use_compile") and device == "cuda":
-        try:
-            print("[model] Compiling transformer with torch.compile …")
-            pipe.transformer = torch.compile(
-                pipe.transformer,
-                mode="reduce-overhead",
-                fullgraph=False,
-            )
-        except Exception as exc:
-            print(f"[model] torch.compile skipped: {exc}")
-
     return pipe
 
 
@@ -239,22 +276,31 @@ def load_pipeline(model_id: str | None, hw_cfg: dict) -> tuple[Any, dict]:
             f"Unknown model '{model_id}'. Choose from: {list(MODELS.keys())}"
         )
 
-    info     = MODELS[model_id]
-    repo_id  = info["repo_id"]
-    pipeline = info["pipeline"]
+    # Hard stop with a clear upgrade message if diffusers is too old
+    _check_version_for_model(model_id)
+
+    info    = MODELS[model_id]
+    repo_id = info["repo_id"]
 
     print(f"[model] Selected: {model_id} ({info['size_label']})  repo={repo_id}")
 
-    # Ensure weights are present locally
+    # Ensure weights are cached locally
     ensure_model_downloaded(repo_id)
 
-    # Load into memory
-    if pipeline == "CogVideoXPipeline":
-        pipe = _load_cogvideox(repo_id, hw_cfg)
-    elif pipeline == "LTXPipeline":
-        pipe = _load_ltx(repo_id, hw_cfg)
+    # Pick the right class (or None → DiffusionPipeline fallback)
+    pipeline_name = info["pipeline"]
+    if pipeline_name == "CogVideoXPipeline":
+        cls = CogVideoXPipeline
+    elif pipeline_name == "LTXPipeline":
+        cls = LTXPipeline
     else:
-        raise NotImplementedError(f"Pipeline type '{pipeline}' is not implemented.")
+        cls = None
+
+    # Load from cache
+    pipe = _load_pipeline(repo_id, cls, hw_cfg)
+
+    # Memory / speed optimisations
+    pipe = _apply_optimisations(pipe, hw_cfg, model_id)
 
     print(f"[model] Ready: {model_id}\n")
     return pipe, info
