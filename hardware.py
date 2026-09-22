@@ -48,6 +48,9 @@ def detect_device() -> dict:
             else "[CUDA]"
         )
 
+        # Reduce memory fragmentation — recovers ~10-15% usable VRAM
+        os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
         if gpu_count > 1:
             names = [torch.cuda.get_device_name(i) for i in range(gpu_count)]
             vrams = [
