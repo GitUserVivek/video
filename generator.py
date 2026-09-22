@@ -74,12 +74,15 @@ from cache import RunCache, RunSignature, default_cache_root
 
 
 # ── Resolution presets ────────────────────────────────────────────────────────
-# All dimensions must be divisible by 8 (CogVideoX hard requirement)
+# All dimensions must be divisible by 32 (LTX-Video hard requirement; also
+# satisfies CogVideoX's divisible-by-8 requirement).
+# Standard broadcast heights (480, 720, 1080) are NOT divisible by 32, so we
+# use the nearest valid values that preserve the 16:9 aspect ratio.
 
 RESOLUTIONS: dict[str, tuple[int, int]] = {
-    "480":  (848,  480),   # 848 = 106×8  (was 854 — not divisible by 8)
-    "720":  (1280, 720),   # 1280 = 160×8 ✓
-    "1080": (1920, 1080),  # 1920 = 240×8 ✓
+    "480":  (832,  480),   # 832 = 26×32 ✓  480 = 15×32 ✓
+    "720":  (1280, 736),   # 1280 = 40×32 ✓  736 = 23×32 ✓  (was 720 — not div by 32)
+    "1080": (1920, 1088),  # 1920 = 60×32 ✓  1088 = 34×32 ✓  (was 1080 — not div by 32)
 }
 
 DEFAULT_FPS = 8            # CogVideoX native; LTX can do 24 fps
