@@ -68,7 +68,7 @@ HF_TOKEN: str | None = None   # ← paste your token here, e.g. "hf_xxxxxxxxxxxx
 
 # If left as None, falls back to the HF_TOKEN environment variable if set.
 if HF_TOKEN is None:
-    HF_TOKEN = os.environ.get("HF_TOKEN") or "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"
+    HF_TOKEN = os.environ.get("HF_TOKEN") or "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"
 
 if HF_TOKEN:
     os.environ["HF_TOKEN"] = HF_TOKEN
