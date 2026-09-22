@@ -43,3 +43,10 @@ opencv-python-headless>=4.10.0.84
 # ── Optional quality-of-life ─────────────────────────────────────────────────
 psutil>=6.0.0
 tqdm>=4.66.5
+
+# ── Memory-efficient attention (strongly recommended for T4 / <24 GB GPUs) ───
+# xformers replaces O(N²) attention with a tiled kernel — prevents CogVideoX
+# attention OOM on cards with < 24 GB VRAM.
+# Install the build matching your torch+CUDA version:
+#   pip install xformers==0.0.27 --index-url https://download.pytorch.org/whl/cu121
+xformers>=0.0.27

@@ -221,18 +221,44 @@ def _load_pipeline(repo_id: str, pipeline_cls: Any, hw_cfg: dict) -> Any:
     return pipe
 
 
+def _try_enable_xformers(pipe: Any) -> bool:
+    """Enable xformers memory-efficient attention if available.
+
+    xformers replaces F.scaled_dot_product_attention with a tiled/chunked
+    kernel that never materialises the full QKᵀ matrix in VRAM.
+    This is the primary fix for CogVideoX attention OOM on T4-class GPUs.
+
+    Returns True if successfully enabled.
+    """
+    try:
+        import xformers  # noqa: F401
+        if hasattr(pipe, "enable_xformers_memory_efficient_attention"):
+            pipe.enable_xformers_memory_efficient_attention()
+            print("[model] xformers memory-efficient attention enabled ✓")
+            return True
+    except ImportError:
+        pass
+    except Exception as exc:
+        print(f"[model] xformers available but failed to enable: {exc}")
+    return False
+
+
 def _apply_optimisations(pipe: Any, hw_cfg: dict, model_id: str) -> Any:
     """Apply memory / speed optimisations and return the pipeline.
 
-    Strategy by hardware:
-      Single GPU ≥ full_vram GB   → .to("cuda")  (fastest)
-      Single GPU ≥ min_vram GB    → enable_model_cpu_offload()
-      Single GPU < min_vram GB    → enable_sequential_cpu_offload()
-      Multi-GPU (any config)      → enable_model_cpu_offload(gpu_id=0)
-                                    Offload executes each sub-module on GPU 0,
-                                    keeping only one layer's weights+activations
-                                    in VRAM at a time — avoids the attention OOM.
-      CPU                         → enable_sequential_cpu_offload()
+    Attention OOM fix (primary):
+        xformers memory-efficient attention replaces scaled_dot_product_attention
+        with a tiled kernel — never allocates the full QKᵀ matrix.
+        Attempted first on all CUDA paths.
+
+    Placement strategy:
+        Multi-GPU any config         → sequential_cpu_offload
+                                       (streams one layer at a time through GPU 0,
+                                        xformers keeps attention from OOMing)
+        Single GPU ≥ full_vram GB    → .to("cuda")
+        Single GPU ≥ min_vram GB     → enable_model_cpu_offload()
+        Single GPU < min_vram GB     → enable_sequential_cpu_offload()
+        CPU                          → enable_sequential_cpu_offload()
     """
     device    = hw_cfg["device"]
     vram_gb   = hw_cfg.get("vram_gb", 0)
@@ -247,16 +273,20 @@ def _apply_optimisations(pipe: Any, hw_cfg: dict, model_id: str) -> Any:
     min_vram  = _MIN_VRAM.get(key, 8)
 
     if device == "cuda":
+        # ── xformers first — reduces peak attention VRAM from O(N²) to O(N) ──
+        xformers_ok = _try_enable_xformers(pipe)
+        if not xformers_ok:
+            print("[model] xformers not available — attention_slicing will be used instead")
+
+        # ── Placement ──────────────────────────────────────────────────────────
         if gpu_count > 1:
-            # Multi-GPU: use model_cpu_offload on GPU 0.
-            # This streams one sub-module at a time through GPU 0 —
-            # weights live in CPU RAM between uses, activations never
-            # accumulate across layers, attention OOM is impossible.
+            # sequential_cpu_offload: one transformer block at a time on GPU 0.
+            # Combined with xformers this handles any resolution on T4 × 2.
             print(
                 f"[model] Multi-GPU ({gpu_count}× GPU, {hw_cfg.get('total_vram_gb', 0):.0f} GB): "
-                f"using model_cpu_offload on GPU 0 to prevent attention OOM"
+                f"using sequential_cpu_offload on GPU 0"
             )
-            pipe.enable_model_cpu_offload(gpu_id=0)
+            pipe.enable_sequential_cpu_offload(gpu_id=0)
         elif vram_gb >= full_vram:
             print(f"[model] {vram_gb:.0f} GB VRAM — loading fully onto GPU")
             pipe = pipe.to(device)
@@ -267,8 +297,10 @@ def _apply_optimisations(pipe: Any, hw_cfg: dict, model_id: str) -> Any:
             print(f"[model] {vram_gb:.0f} GB VRAM — using sequential CPU offload")
             pipe.enable_sequential_cpu_offload()
 
-        if hasattr(pipe, "enable_attention_slicing"):
-            pipe.enable_attention_slicing()
+        # attention_slicing: fallback chunked attention when xformers unavailable
+        if not xformers_ok and hasattr(pipe, "enable_attention_slicing"):
+            pipe.enable_attention_slicing(slice_size=1)   # slice_size=1 = maximum saving
+
         if hasattr(pipe, "enable_vae_slicing"):
             pipe.enable_vae_slicing()
         if hasattr(pipe, "enable_vae_tiling"):
@@ -280,7 +312,7 @@ def _apply_optimisations(pipe: Any, hw_cfg: dict, model_id: str) -> Any:
     else:  # CPU
         pipe.enable_sequential_cpu_offload()
 
-    # torch.compile only when fully resident on a single GPU
+    # torch.compile only when fully resident on a single high-VRAM GPU
     compile_ok = (
         hw_cfg.get("use_compile")
         and device == "cuda"
