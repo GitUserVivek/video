@@ -203,12 +203,12 @@ def _load_pipeline(repo_id: str, pipeline_cls: Any, hw_cfg: dict) -> Any:
 
     if use_device_map:
         print(f"[model] Loading {cls_name} ({dtype}) across {gpu_count} GPUs "
-              f"with device_map='auto' …")
+              f"with device_map='balanced' …")
         pipe = loader.from_pretrained(
             repo_id,
             torch_dtype=dtype,
             cache_dir=str(HF_CACHE / "hub"),
-            device_map="auto",          # Accelerate shards across all GPUs
+            device_map="balanced",      # diffusers: splits layers evenly across GPUs
         )
     else:
         print(f"[model] Loading {cls_name} ({dtype}) …")
@@ -249,8 +249,8 @@ def _apply_optimisations(pipe: Any, hw_cfg: dict, model_id: str) -> Any:
 
     if device == "cuda":
         if use_device_map:
-            # Model is already distributed across GPUs by Accelerate — nothing to move
-            print(f"[model] Multi-GPU: model sharded across {hw_cfg['gpu_count']} GPUs "
+            # Model is already distributed across GPUs by device_map="balanced" — nothing to move
+            print(f"[model] Multi-GPU: model balanced across {hw_cfg['gpu_count']} GPUs "
                   f"({total_vram_gb:.0f} GB total VRAM)")
         elif vram_gb >= full_vram:
             print(f"[model] {vram_gb:.0f} GB VRAM ≥ {full_vram} GB — loading fully onto GPU")
