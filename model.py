@@ -224,10 +224,6 @@ def _load_pipeline(repo_id: str, pipeline_cls: Any, hw_cfg: dict) -> Any:
 def _try_enable_xformers(pipe: Any) -> bool:
     """Enable xformers memory-efficient attention if available.
 
-    xformers replaces F.scaled_dot_product_attention with a tiled/chunked
-    kernel that never materialises the full QKᵀ matrix in VRAM.
-    This is the primary fix for CogVideoX attention OOM on T4-class GPUs.
-
     Returns True if successfully enabled.
     """
     try:
@@ -243,18 +239,39 @@ def _try_enable_xformers(pipe: Any) -> bool:
     return False
 
 
+def _apply_chunked_attention(pipe: Any, vram_gb: float) -> bool:
+    """Apply chunked attention patch as fallback when xformers is unavailable.
+
+    chunk_size tuned to leave enough VRAM for weights + activations on T4.
+      T4 15 GB  → chunk_size=512  → peak attn ~300 MB
+      8 GB GPU  → chunk_size=256  → peak attn ~150 MB
+      ≥24 GB    → chunk_size=2048 → peak attn ~1.2 GB (fast)
+    """
+    try:
+        from chunked_attention import patch_cogvideox_attention
+        if vram_gb >= 24:
+            chunk = 2048
+        elif vram_gb >= 12:
+            chunk = 512
+        else:
+            chunk = 256
+        patch_cogvideox_attention(pipe, chunk_size=chunk)
+        return True
+    except Exception as exc:
+        print(f"[model] chunked attention patch failed: {exc}")
+        return False
+
+
 def _apply_optimisations(pipe: Any, hw_cfg: dict, model_id: str) -> Any:
     """Apply memory / speed optimisations and return the pipeline.
 
-    Attention OOM fix (primary):
-        xformers memory-efficient attention replaces scaled_dot_product_attention
-        with a tiled kernel — never allocates the full QKᵀ matrix.
-        Attempted first on all CUDA paths.
+    Attention OOM fix (critical for CogVideoX on T4):
+        1. Try xformers (O(N) attention) — best if installed
+        2. Fall back to chunked attention patch (processes Q in 512-token blocks)
+        Both prevent the 97 GB QKᵀ matrix allocation.
 
     Placement strategy:
-        Multi-GPU any config         → sequential_cpu_offload
-                                       (streams one layer at a time through GPU 0,
-                                        xformers keeps attention from OOMing)
+        Multi-GPU any config         → sequential_cpu_offload on GPU 0
         Single GPU ≥ full_vram GB    → .to("cuda")
         Single GPU ≥ min_vram GB     → enable_model_cpu_offload()
         Single GPU < min_vram GB     → enable_sequential_cpu_offload()
@@ -263,44 +280,42 @@ def _apply_optimisations(pipe: Any, hw_cfg: dict, model_id: str) -> Any:
     device    = hw_cfg["device"]
     vram_gb   = hw_cfg.get("vram_gb", 0)
     gpu_count = hw_cfg.get("gpu_count", 1)
+    mid       = model_id.lower()
 
     _FULL_VRAM = {"cogvideox-5b": 24, "cogvideox-2b": 12, "ltx-video": 8}
     _MIN_VRAM  = {"cogvideox-5b": 16, "cogvideox-2b":  8, "ltx-video": 5}
-
-    mid       = model_id.lower()
-    key       = next((k for k in _FULL_VRAM if k in mid), None)
-    full_vram = _FULL_VRAM.get(key, 12)
-    min_vram  = _MIN_VRAM.get(key, 8)
+    key        = next((k for k in _FULL_VRAM if k in mid), None)
+    full_vram  = _FULL_VRAM.get(key, 12)
+    min_vram   = _MIN_VRAM.get(key, 8)
 
     if device == "cuda":
-        # ── xformers first — reduces peak attention VRAM from O(N²) to O(N) ──
-        xformers_ok = _try_enable_xformers(pipe)
-        if not xformers_ok:
-            print("[model] xformers not available — attention_slicing will be used instead")
+        # ── Step 1: fix attention BEFORE placement ─────────────────────────
+        is_cogvideox = "cogvideox" in mid
+        if is_cogvideox:
+            xformers_ok = _try_enable_xformers(pipe)
+            if not xformers_ok:
+                chunked_ok = _apply_chunked_attention(pipe, vram_gb)
+                if not chunked_ok:
+                    print("[model] WARNING: no attention fix applied — OOM likely")
 
-        # ── Placement ──────────────────────────────────────────────────────────
+        # ── Step 2: placement ──────────────────────────────────────────────
         if gpu_count > 1:
-            # sequential_cpu_offload: one transformer block at a time on GPU 0.
-            # Combined with xformers this handles any resolution on T4 × 2.
             print(
-                f"[model] Multi-GPU ({gpu_count}× GPU, {hw_cfg.get('total_vram_gb', 0):.0f} GB): "
-                f"using sequential_cpu_offload on GPU 0"
+                f"[model] Multi-GPU ({gpu_count}× GPU, {hw_cfg.get('total_vram_gb',0):.0f} GB): "
+                f"sequential_cpu_offload on GPU 0"
             )
             pipe.enable_sequential_cpu_offload(gpu_id=0)
         elif vram_gb >= full_vram:
             print(f"[model] {vram_gb:.0f} GB VRAM — loading fully onto GPU")
             pipe = pipe.to(device)
         elif vram_gb >= min_vram:
-            print(f"[model] {vram_gb:.0f} GB VRAM — using model CPU offload")
+            print(f"[model] {vram_gb:.0f} GB VRAM — model CPU offload")
             pipe.enable_model_cpu_offload()
         else:
-            print(f"[model] {vram_gb:.0f} GB VRAM — using sequential CPU offload")
+            print(f"[model] {vram_gb:.0f} GB VRAM — sequential CPU offload")
             pipe.enable_sequential_cpu_offload()
 
-        # attention_slicing: fallback chunked attention when xformers unavailable
-        if not xformers_ok and hasattr(pipe, "enable_attention_slicing"):
-            pipe.enable_attention_slicing(slice_size=1)   # slice_size=1 = maximum saving
-
+        # VAE optimisations (always safe)
         if hasattr(pipe, "enable_vae_slicing"):
             pipe.enable_vae_slicing()
         if hasattr(pipe, "enable_vae_tiling"):
@@ -308,11 +323,10 @@ def _apply_optimisations(pipe: Any, hw_cfg: dict, model_id: str) -> Any:
 
     elif device == "mps":
         pipe = pipe.to(device)
-
-    else:  # CPU
+    else:
         pipe.enable_sequential_cpu_offload()
 
-    # torch.compile only when fully resident on a single high-VRAM GPU
+    # torch.compile — single GPU, fully resident, no offload hooks
     compile_ok = (
         hw_cfg.get("use_compile")
         and device == "cuda"
