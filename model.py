@@ -113,6 +113,25 @@ MODELS: dict[str, dict] = {
         "default_fps":       24,
         "max_native_frames": 121,
     },
+    # ── Distilled LTX-Video 2B v0.9.8 ──────────────────────────────────────
+    # Same weights repo as ltx-video but with the distilled transformer swapped
+    # in after loading.  Guidance-distilled: use guidance_scale=1.0.
+    # Timestep-distilled: 4 steps is enough for good results (max 8).
+    # ~15× faster than the base model — the best speed/quality trade-off on
+    # low-VRAM hardware.
+    "ltx-video-distilled": {
+        "repo_id":            "Lightricks/LTX-Video",
+        "pipeline":           "LTXPipeline",
+        "min_vram":           4,
+        "size_label":         "~2B-dist",
+        "requires_ver":       "0.32.0",
+        "default_steps":      4,
+        "default_guidance":   1.0,    # guidance-distilled: CFG must be 1.0
+        "default_fps":        24,
+        "max_native_frames":  121,
+        # The single safetensors file that replaces the base transformer:
+        "distilled_weights":  "ltxv-2b-0.9.8-distilled.safetensors",
+    },
 }
 
 # Cache directory
@@ -183,10 +202,11 @@ _IGNORE_PATTERNS: dict[str, list[str]] = {
         "ltx-video-2b-v0.9.1.safetensors",
         "ltx-video-2b-v0.9-image-to-video*",
         "ltx-video-2b-v0.9.1-image-to-video*",
-        # ── 2B distilled variants ─────────────────────────────────────────
+        # ── 2B distilled variants (older; keep 0.9.8-distilled below) ────
         "ltxv-2b-0.9.6-dev-04-25.safetensors",
         "ltxv-2b-0.9.6-distilled-04-25.safetensors",
-        "ltxv-2b-0.9.8-distilled.safetensors",
+        # NOTE: ltxv-2b-0.9.8-distilled.safetensors is NOT ignored —
+        #       it is downloaded when the "ltx-video-distilled" model is used.
         "ltxv-2b-0.9.8-distilled-fp8.safetensors",
         # ── All 13B variants (too large) ─────────────────────────────────
         "ltxv-13b-*.safetensors",
@@ -246,6 +266,7 @@ _SIZE_HINTS = {
 #     ],
 # }
 _REQUIRED_FILES: dict[str, list[str]] = {
+    # Base LTX-Video (v0.9.5 checkpoint) — used by "ltx-video"
     "Lightricks/LTX-Video": [
         "model_index.json",
         "transformer/config.json",
@@ -255,9 +276,22 @@ _REQUIRED_FILES: dict[str, list[str]] = {
         "tokenizer/special_tokens_map.json",
         "tokenizer/spiece.model",
     ],
+    # Distilled LTX-Video (v0.9.8-distilled) — used by "ltx-video-distilled"
+    # Reuses all of the above + one extra transformer weight file.
+    # We handle the download by adding the distilled weights to the base set.
+    "Lightricks/LTX-Video/distilled": [
+        "model_index.json",
+        "transformer/config.json",
+        "ltx-video-2b-v0.9.5.safetensors",   # still needed for VAE/text-encoder config
+        "ltxv-2b-0.9.8-distilled.safetensors",
+        "vae/config.json",
+        "text_encoder/config.json",
+        "tokenizer/special_tokens_map.json",
+        "tokenizer/spiece.model",
+    ],
 }
 
-def ensure_model_downloaded(repo_id: str) -> Path:
+def ensure_model_downloaded(repo_id: str, model_id: str | None = None) -> Path:
     """Download only the exact files needed for inference.
 
     For repos in _REQUIRED_FILES: uses hf_hub_download() one file at a time —
@@ -267,6 +301,20 @@ def ensure_model_downloaded(repo_id: str) -> Path:
     """
     safe_name    = repo_id.replace("/", "--")
     snapshot_dir = HF_CACHE / "hub" / f"models--{safe_name}"
+
+    # For the distilled variant, delegate to the base repo but request extra files
+    if model_id == "ltx-video-distilled":
+        distilled_file = MODELS["ltx-video-distilled"]["distilled_weights"]
+        required = _REQUIRED_FILES.get("Lightricks/LTX-Video/distilled", [])
+        # Check if distilled weight is already cached
+        if snapshot_dir.exists():
+            hits = list(snapshot_dir.glob(f"**/{distilled_file}"))
+            if hits:
+                print(f"[model] Cache hit: {repo_id} (distilled)")
+                return snapshot_dir
+        size_hint = _SIZE_HINTS.get(repo_id, "~6 GB  (distilled transformer only)")
+        print(f"[model] Downloading {repo_id}  {size_hint}")
+        return _download_exact_files(repo_id, required)
 
     # Cache hit check
     if snapshot_dir.exists():
@@ -534,6 +582,70 @@ def _apply_chunked_attention(pipe: Any, vram_gb: float) -> bool:
         return False
 
 
+def _swap_ltx_distilled_transformer(pipe: Any, repo_id: str, info: dict, hw_cfg: dict) -> Any:
+    """Replace the base LTX-Video transformer with the distilled checkpoint.
+
+    The distilled safetensors file lives in the same HF repo as the base model.
+    We locate it in the HF blob cache via hf_hub_download (no re-download if
+    already present), then load it with LTXVideoTransformer3DModel.from_single_file()
+    and hot-swap it into the pipeline before optimisations are applied.
+
+    Guidance-distilled: guidance_scale must be 1.0 at inference time.
+    Timestep-distilled: 4 steps is optimal; beyond 8 doesn't help.
+    """
+    distilled_file: str = info["distilled_weights"]
+    dtype = hw_cfg["dtype"]
+
+    print(f"[model] Swapping in distilled transformer: {distilled_file} …")
+
+    try:
+        from huggingface_hub import hf_hub_download
+
+        local_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=distilled_file,
+            cache_dir=str(HF_CACHE / "hub"),
+            token=HF_TOKEN or None,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to locate distilled transformer '{distilled_file}' "
+            f"from {repo_id}.\n"
+            f"  {type(exc).__name__}: {exc}\n\n"
+            f"Try: python main.py --model ltx-video  (uses the base checkpoint)"
+        ) from exc
+
+    # Load just the transformer from the single file
+    try:
+        from diffusers import LTXVideoTransformer3DModel
+
+        distilled_transformer = LTXVideoTransformer3DModel.from_single_file(
+            local_path,
+            torch_dtype=dtype,
+        )
+    except Exception as exc:
+        # from_single_file may not be available in all diffusers versions
+        # Fall back to safetensors state-dict load into the existing transformer
+        print(f"[model] from_single_file unavailable ({exc}), falling back to state-dict swap …")
+        try:
+            from safetensors.torch import load_file as safe_load
+            state = safe_load(local_path)
+            pipe.transformer.load_state_dict(state, strict=False)
+            pipe.transformer.to(dtype)
+            print(f"[model] Distilled state-dict loaded (strict=False)")
+            return pipe
+        except Exception as exc2:
+            raise RuntimeError(
+                f"Could not load distilled transformer via state-dict either: {exc2}"
+            ) from exc2
+
+    # Replace the transformer in-place
+    pipe.transformer = distilled_transformer
+    print(f"[model] Distilled transformer swapped in ✓  "
+          f"(4–8 steps, guidance_scale=1.0)")
+    return pipe
+
+
 def _apply_optimisations(pipe: Any, hw_cfg: dict, model_id: str) -> Any:
     """Apply memory / speed optimisations and return the pipeline.
 
@@ -659,7 +771,7 @@ def load_pipeline(model_id: str | None, hw_cfg: dict) -> tuple[Any, dict]:
                     f"{hw_cfg['total_vram_gb']:.0f} GB total]")
     print(f"[model] Selected: {model_id} ({info['size_label']})  repo={repo_id}{gpu_info}")
 
-    ensure_model_downloaded(repo_id)
+    ensure_model_downloaded(repo_id, model_id=model_id)
 
     pipeline_name = info["pipeline"]
     if pipeline_name == "CogVideoXPipeline":
@@ -670,6 +782,12 @@ def load_pipeline(model_id: str | None, hw_cfg: dict) -> tuple[Any, dict]:
         cls = None
 
     pipe = _load_pipeline(repo_id, cls, hw_cfg)
+
+    # For the distilled LTX-Video variant: swap in the distilled transformer
+    # after loading the base pipeline (reuses VAE, text encoder, tokenizer).
+    if model_id == "ltx-video-distilled" and LTXPipeline is not None:
+        pipe = _swap_ltx_distilled_transformer(pipe, repo_id, info, hw_cfg)
+
     pipe = _apply_optimisations(pipe, hw_cfg, model_id)
 
     print(f"[model] Ready: {model_id}\n")

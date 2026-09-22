@@ -778,6 +778,9 @@ def _run_pipeline(pipe, model_id, enhanced_prompt, negative, total_frames,
         kwargs["prompt_embeds"] = embeds["positive"]
         if embeds.get("negative") is not None:
             kwargs["negative_prompt_embeds"] = embeds["negative"]
+        # Pipeline rejects having both prompt text and prompt_embeds at once
+        kwargs.pop("prompt", None)
+        kwargs.pop("negative_prompt", None)
 
     with torch.inference_mode():
         try:
