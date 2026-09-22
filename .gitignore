@@ -1,4 +1,4 @@
 *.deb
-*cache*
+*__cache*
 
 # Resume with: kiro-cli --resume-id 3fefe7dd-423c-4516-b73f-6d73b55eca40
