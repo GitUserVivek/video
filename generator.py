@@ -37,11 +37,12 @@ from PIL import Image
 
 
 # ── Resolution presets ────────────────────────────────────────────────────────
+# All dimensions must be divisible by 8 (CogVideoX hard requirement)
 
 RESOLUTIONS: dict[str, tuple[int, int]] = {
-    "480":  (854,  480),
-    "720":  (1280, 720),
-    "1080": (1920, 1080),
+    "480":  (848,  480),   # 848 = 106×8  (was 854 — not divisible by 8)
+    "720":  (1280, 720),   # 1280 = 160×8 ✓
+    "1080": (1920, 1080),  # 1920 = 240×8 ✓
 }
 
 DEFAULT_FPS = 8   # CogVideoX native; LTX can do 24 fps
@@ -145,25 +146,30 @@ def _safe_frames_for_vram(
     total_vram_gb: float,
     model_id: str,
 ) -> int:
-    """Reduce frame count if estimated activation memory would OOM.
+    """Only reduce frames if estimated activation memory would actually OOM.
 
-    Rough heuristic: CogVideoX-5b @ 1080p needs ~150 MB per frame of
-    activation memory. On 31 GB total with 17 GB weights → ~14 GB headroom.
+    CogVideoX-5b weight footprint: ~17 GB in bfloat16.
+    Activation memory per frame (rough): 480p=25 MB, 720p=60 MB, 1080p=140 MB.
+    Only fires when headroom < required — on 31 GB this never triggers for
+    480p or 720p, and only caps 1080p at ~60 frames.
     """
-    if "cogvideox" not in model_id:
+    if "cogvideox" not in model_id or total_vram_gb <= 0:
         return total_frames
 
-    mb_per_frame = {"1080": 150, "720": 65, "480": 30}.get(resolution, 65)
-    headroom_mb  = max(1000, (total_vram_gb - 17) * 1024)  # subtract weight footprint
-    safe_frames  = int(headroom_mb / mb_per_frame)
+    weight_gb    = 17.0
+    headroom_mb  = max(0, (total_vram_gb - weight_gb) * 1024)
+    mb_per_frame = {"1080": 140, "720": 60, "480": 25}.get(resolution, 60)
+    safe_frames  = int(headroom_mb / mb_per_frame) if mb_per_frame > 0 else total_frames
     safe_frames  = _clamp_frames(max(9, safe_frames), model_id)
 
     if safe_frames < total_frames:
         print(
-            f"[gen] VRAM heuristic: reducing frames {total_frames} → {safe_frames} "
-            f"to fit {resolution}p activations in {total_vram_gb:.0f} GB VRAM"
+            f"[gen] VRAM heuristic: capping frames {total_frames} → {safe_frames} "
+            f"({resolution}p @ {total_vram_gb:.0f} GB VRAM, "
+            f"~{headroom_mb:.0f} MB activation headroom)"
         )
-    return min(total_frames, safe_frames)
+        return safe_frames
+    return total_frames
 
 
 # ── Core generation ───────────────────────────────────────────────────────────
