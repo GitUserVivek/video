@@ -15,14 +15,18 @@ Diffusers version compatibility
 Multi-GPU
 ---------
   When hw_cfg["use_device_map"] is True (multiple CUDA GPUs detected),
-  from_pretrained() is called with device_map="auto". Accelerate then
-  shards the model across all available GPUs automatically — no manual
-  tensor splitting required. On 2× T4 (2× 15.6 GB = ~31 GB total) this
-  allows running cogvideox-5b (~18 GB) fully in VRAM.
+  from_pretrained() is called with device_map="balanced". Accelerate then
+  shards the weights evenly across all
+  available GPUs — no manual tensor splitting required, and no per-layer
+  streaming through a single GPU over PCIe. On 2× T4 (2× 15.6 GB = ~31 GB
+  total) this allows running cogvideox-5b (~20 GB in fp16) fully in VRAM.
+  Attention activations are kept small by the chunked attention patch, which
+  is what makes the fully-resident layout possible.
 """
 
 from __future__ import annotations
 
+import gc
 import os
 import time
 from pathlib import Path
@@ -200,25 +204,73 @@ def ensure_model_downloaded(repo_id: str) -> Path:
 
 # ── Pipeline loading ──────────────────────────────────────────────────────────
 
+def _free_vram_report(hw_cfg: dict) -> str:
+    """Describe the headroom accelerate will balance the weights over."""
+    entries = []
+    for i in range(hw_cfg.get("gpu_count", 1)):
+        free_gb, total_gb = (v / 1e9 for v in torch.cuda.mem_get_info(i))
+        entries.append(f"GPU {i}: {free_gb:.1f}/{total_gb:.1f} GB free")
+    return ", ".join(entries)
+
+
+def _report_device_map(pipe: Any) -> None:
+    """Summarise where accelerate actually placed the pipeline's modules."""
+    device_map = getattr(pipe, "hf_device_map", None)
+    if not device_map:
+        return
+
+    buckets: dict[str, int] = {}
+    for device in device_map.values():
+        key = f"cuda:{device}" if isinstance(device, int) else str(device)
+        buckets[key] = buckets.get(key, 0) + 1
+
+    placed = ", ".join(f"{k}: {v} blocks" for k, v in sorted(buckets.items()))
+    print(f"[model] Placement: {placed}")
+
+    spilled = [k for k in buckets if k in ("cpu", "disk")]
+    if spilled:
+        print(f"[model] WARNING: {', '.join(spilled)} hold weights — that path will "
+              f"be slow (raise VRAM or use a smaller model to keep everything on GPU)")
+
+
 def _load_pipeline(repo_id: str, pipeline_cls: Any, hw_cfg: dict) -> Any:
     """Load pipeline from cache.
 
-    device_map="balanced" splits weights but NOT attention activations —
-    on T4-class GPUs cogvideox-5b's QKᵀ attention matrices still OOM on a
-    single GPU during the forward pass. So we always load with plain
-    from_pretrained() and let _apply_optimisations handle placement.
+    Multi-GPU: weights are sharded across every visible GPU with accelerate's
+    `device_map="balanced"`. Each `CogVideoXBlock` is a `_no_split_module`, so a
+    block is never cut in half across GPUs — only the activation handoff at the
+    shard boundary happens (one small copy per forward pass). Combined with the
+    chunked attention patch this keeps both GPUs holding and computing weights,
+    instead of streaming every layer through GPU 0 over PCIe.
     """
     dtype    = hw_cfg["dtype"]
     loader   = pipeline_cls if pipeline_cls is not None else DiffusionPipeline
     cls_name = loader.__name__ if loader else "DiffusionPipeline"
+    shard    = hw_cfg.get("use_device_map", False) and hw_cfg.get("gpu_count", 0) > 1
 
     print(f"[model] Loading {cls_name} ({dtype}) …")
-    pipe = loader.from_pretrained(
-        repo_id,
-        torch_dtype=dtype,
-        cache_dir=str(HF_CACHE / "hub"),
-    )
-    return pipe
+    base_kwargs: dict[str, Any] = {"torch_dtype": dtype, "cache_dir": str(HF_CACHE / "hub")}
+
+    if shard:
+        # No explicit `max_memory` map: accelerate sizes its balanced split from the
+        # *currently free* VRAM of every GPU (plus RAM as a spill target), which
+        # adapts to a Kaggle session that already has other allocations. Only CPU
+        # spill would slow us down, and `_report_device_map` calls that out.
+        print(f"[model] device_map=\"balanced\"  ({_free_vram_report(hw_cfg)})")
+        try:
+            pipe = loader.from_pretrained(repo_id, device_map="balanced", **base_kwargs)
+            _report_device_map(pipe)
+            return pipe
+        except Exception as exc:
+            # A failed sharded load must not cost the user a 30-minute session.
+            print(f"[model] Sharded load failed ({type(exc).__name__}: {exc})")
+            print("[model] Falling back to single-GPU residency + CPU offload")
+            hw_cfg["use_device_map"] = False   # keep every downstream path consistent
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    return loader.from_pretrained(repo_id, **base_kwargs)
 
 
 def _try_enable_xformers(pipe: Any) -> bool:
@@ -274,7 +326,7 @@ def _apply_optimisations(pipe: Any, hw_cfg: dict, model_id: str) -> Any:
         Both prevent the 97 GB QKᵀ matrix allocation.
 
     Placement strategy:
-        Multi-GPU any config         → sequential_cpu_offload on GPU 0
+        Multi-GPU device_map        → weights already sharded, no offload needed
         Single GPU ≥ full_vram GB    → .to("cuda")
         Single GPU ≥ min_vram GB     → enable_model_cpu_offload()
         Single GPU < min_vram GB     → enable_sequential_cpu_offload()
@@ -302,10 +354,14 @@ def _apply_optimisations(pipe: Any, hw_cfg: dict, model_id: str) -> Any:
                     print("[model] WARNING: no attention fix applied — OOM likely")
 
         # ── Step 2: placement ──────────────────────────────────────────────
-        if gpu_count > 1:
+        if hw_cfg.get("use_device_map") and gpu_count > 1:
             print(
-                f"[model] Multi-GPU ({gpu_count}× GPU, {hw_cfg.get('total_vram_gb',0):.0f} GB): "
-                f"sequential_cpu_offload on GPU 0"
+                f"[model] Multi-GPU: weights sharded across {gpu_count} GPUs "
+                f"({hw_cfg.get('total_vram_gb', 0):.0f} GB total) — no CPU offload"
+            )
+        elif gpu_count > 1:
+            print(
+                f"[model] Multi-GPU without device_map — CPU offload on GPU 0"
             )
             pipe.enable_sequential_cpu_offload(gpu_id=0)
         elif vram_gb >= full_vram:

@@ -25,7 +25,7 @@ def detect_device() -> dict:
         gpu_count           int        – number of CUDA devices visible
         use_compile         bool       – whether torch.compile is safe
         sequential_offload  bool       – layer-by-layer CPU offload
-        use_device_map      bool       – use device_map="auto" to shard across GPUs
+        use_device_map      bool       – shard weights across GPUs with device_map
         threads             int|None   – OMP/MKL thread count (None ⇒ PyTorch default)
         max_resolution      str        – '480' | '720' | '1080'
         max_model_size      str        – '1.3B' | '7B' | '14B'
@@ -67,15 +67,23 @@ def detect_device() -> dict:
         # Use total VRAM for model/resolution selection when multi-GPU
         effective_vram = total_vram_gb
 
+        # Turing (T4, sm_75) has fp16 tensor cores but only *emulates* bf16;
+        # Ampere+ (sm_80+) runs bf16 natively. Picking the wrong one costs several
+        # times the throughput on the matmul-heavy transformer, so key this off the
+        # compute capability instead of the VRAM size.
+        compute_major = torch.cuda.get_device_capability(0)[0]
+
         return {
             "device": "cuda",
-            "dtype": torch.bfloat16 if vram_gb >= 8 else torch.float16,
+            "dtype": torch.bfloat16 if compute_major >= 8 else torch.float16,
+            "compute_capability": compute_major,
             "vram_gb": vram_gb,                   # single GPU (GPU 0) VRAM
             "total_vram_gb": total_vram_gb,        # all GPUs combined
             "gpu_count": gpu_count,
             "use_compile": gpu_count == 1,         # torch.compile + device_map don't mix well
             "sequential_offload": effective_vram < 8,
-            # use device_map="auto" whenever there are multiple GPUs
+            # Shard the pipeline's weights across every GPU with accelerate
+            # device_map="balanced" whenever more than one is present.
             "use_device_map": gpu_count > 1,
             "threads": None,
             "max_resolution": (
@@ -150,12 +158,17 @@ def print_device_summary(cfg: dict) -> None:
     print("\n── Hardware Configuration ──────────────────────────────")
     print(f"  Device            : {cfg['device'].upper()}")
     print(f"  Dtype             : {cfg['dtype']}")
+    if cfg.get("compute_capability"):
+        print(f"  Compute capability: sm_{cfg['compute_capability']}")
     if cfg.get("gpu_count", 0) > 1:
         print(f"  GPUs              : {cfg['gpu_count']}× "
               f"(total {cfg['total_vram_gb']:.1f} GB VRAM, "
               f"{cfg['vram_gb']:.1f} GB each)")
-        print(f"  Offload strategy  : model_cpu_offload on GPU 0 "
-              f"(prevents attention OOM on multi-T4)")
+        if cfg.get("use_device_map"):
+            print(f"  Offload strategy  : device_map=\"balanced\" — weights sharded "
+                  f"across all {cfg['gpu_count']} GPUs (no CPU streaming)")
+        else:
+            print("  Offload strategy  : CPU offload on GPU 0")
     elif cfg.get("vram_gb"):
         print(f"  VRAM              : {cfg['vram_gb']:.1f} GB")
     if cfg.get("threads"):

@@ -127,22 +127,18 @@ def _chunked_scaled_dot_product_attention(
     """`F.scaled_dot_product_attention` with Q-chunking (never builds the full N² matrix).
 
     Memory peak: O(B × H × chunk × N) instead of O(B × H × N²).
-    For N=20,896 (480p, 49 frames) and chunk=512 over 30 heads:
-        full  : 30 × 20,896² × 4 B ≈ 52 GB  ✗
-        chunk :  512 × 30 × 20,896 × 4 B ≈ 1.3 GB (auto-clamped to < 512 MB) ✓
+    For N=20,896 (480p, 49 frames) and 30 heads:
+        full  : 30 × 20,896² × 2 B ≈ 26 GB (fp16 scores)            ✗
+        chunk : 214 × 30 × 20,896 × 4 B ≈ 512 MB (fp32 softmax, clamp) ✓
+
+    The QKᵀ / PV GEMMs stay in the model's dtype so they hit the tensor cores;
+    only the softmax is upcast to fp32, exactly like SDPA itself does. Running the
+    GEMMs in fp32 would be ~4-8× slower on Turing (T4), which has no fp32 tensor
+    cores.
     """
-    if query.dtype == torch.float32 and key.dtype == torch.float32:
-        # Already fp32 — nothing to upcast.
-        key_t = key.transpose(-2, -1)
-        value_f = value
-    else:
-        # Keys/values stay in fp32 for the whole loop: SDPA upcasts internally
-        # too, and on Turing (T4) fp32 matmul is no slower than emulated bf16.
-        key_t = key.transpose(-2, -1).to(torch.float32)
-        value_f = value.to(torch.float32)
+    key_t = key.transpose(-2, -1)
 
     batch_size, heads, query_len, head_dim = query.shape
-    out_dtype = query.dtype
     scale_factor = scale if scale is not None else (head_dim ** -0.5)
     chunk = _resolve_chunk_size(chunk_size, heads, query_len, max_score_mb)
 
@@ -151,10 +147,9 @@ def _chunked_scaled_dot_product_attention(
     for start in range(0, query_len, chunk):
         end = min(start + chunk, query_len)
         q_blk = query[:, :, start:end, :]
-        q_f = q_blk if q_blk.dtype == torch.float32 else q_blk.to(torch.float32)
 
-        # (B, H, chunk, N) — this is the only large tensor, freed each iteration.
-        scores = torch.matmul(q_f, key_t) * scale_factor
+        # (B, H, chunk, N) — the only large tensor, freed each iteration.
+        scores = torch.matmul(q_blk, key_t) * scale_factor
 
         if is_causal:
             q_idx = torch.arange(start, end, device=query.device).unsqueeze(1)
@@ -168,13 +163,14 @@ def _chunked_scaled_dot_product_attention(
             else:
                 scores = scores + mask_blk.to(scores.dtype)
 
-        probs = torch.softmax(scores, dim=-1)
+        # fp32 softmax for numerical stability, then back to the compute dtype.
+        probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(value.dtype)
         del scores
 
         if dropout_p > 0.0 and torch.is_grad_enabled():
             probs = F.dropout(probs, p=dropout_p)
 
-        output[:, :, start:end, :] = torch.matmul(probs, value_f).to(out_dtype)
+        output[:, :, start:end, :] = torch.matmul(probs, value)
         del probs
 
     return output

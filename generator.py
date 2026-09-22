@@ -13,7 +13,16 @@ Keywords detected in the prompt automatically adjust generation params:
   Frame rate  : "24fps", "30 fps", "60fps"
   Quality     : "high quality", "best quality", "ultra", "low quality", "draft"
 
-CLI flags always win over prompt-inferred values if explicitly set.
+Anything the prompt asks for wins over the defaults (480p, 10 s, model fps);
+an explicitly passed CLI flag still wins over both.
+
+Duration handling
+-----------------
+CogVideoX 1.0 is trained on 49 frames (6.1 s at its native 8 fps), and asking it
+for more yields drift. So the requested duration is met in two steps: generate the
+native clip, then *retime* it to `duration × fps` frames by blending adjacent
+frames (see `_retime_frames`). A "10 second" prompt therefore still generates 49
+frames, but the resulting file really is 10 s long at the requested frame rate.
 
 OOM recovery
 ------------
@@ -45,7 +54,13 @@ RESOLUTIONS: dict[str, tuple[int, int]] = {
     "1080": (1920, 1080),  # 1920 = 240×8 ✓
 }
 
-DEFAULT_FPS = 8   # CogVideoX native; LTX can do 24 fps
+DEFAULT_FPS = 8            # CogVideoX native; LTX can do 24 fps
+DEFAULT_RESOLUTION = "480" # 480p is the sweet spot on T4-class GPUs
+DEFAULT_DURATION_SEC = 10.0
+MAX_OUTPUT_FRAMES = 300    # hard cap on retimed output (~37 s @ 8 fps)
+
+# Resolution tiers, low→high (used to compare a request against GPU capability)
+_RES_ORDER = ["480", "720", "1080"]
 
 
 # ── Prompt parsing ────────────────────────────────────────────────────────────
@@ -140,24 +155,38 @@ def _clamp_frames(requested: int, model_id: str) -> int:
     return max(8, min(200, requested))
 
 
+# Full pipeline footprint in fp16 (transformer + T5-XXL text encoder + VAE).
+# With adaptive multi-GPU sharding each GPU only holds ~1/gpu_count of this.
+_PIPELINE_WEIGHTS_GB: dict[str, float] = {
+    "cogvideox-2b": 14.0,
+    "cogvideox-5b": 20.0,
+    "ltx-video": 6.0,
+}
+
+
+def _pipeline_weights_gb(model_id: str) -> float:
+    return next((w for k, w in _PIPELINE_WEIGHTS_GB.items() if k in model_id), 12.0)
+
+
 def _safe_frames_for_vram(
     total_frames: int,
     resolution: str,
-    total_vram_gb: float,
+    per_gpu_vram_gb: float,
+    weights_gb_per_gpu: float,
     model_id: str,
 ) -> int:
     """Only reduce frames if estimated activation memory would actually OOM.
 
-    CogVideoX-5b weight footprint: ~17 GB in bfloat16.
-    Activation memory per frame (rough): 480p=25 MB, 720p=60 MB, 1080p=140 MB.
-    Only fires when headroom < required — on 31 GB this never triggers for
-    480p or 720p, and only caps 1080p at ~60 frames.
+    Everything is measured on the *busiest single GPU* — with device_map sharding
+    that is where the activations have to fit. Attention itself is chunked (a ~0.5-
+    1 GB working set regardless of frame count), so the frame-dependent term is the
+    latent/activation state: ~25 MB/frame at 480p, ~60 MB at 720p, ~140 MB at 1080p.
+    On 2×15.6 GB this never fires for 480p or 720p.
     """
-    if "cogvideox" not in model_id or total_vram_gb <= 0:
+    if "cogvideox" not in model_id or per_gpu_vram_gb <= 0:
         return total_frames
 
-    weight_gb    = 17.0
-    headroom_mb  = max(0, (total_vram_gb - weight_gb) * 1024)
+    headroom_mb  = max(0, (per_gpu_vram_gb - weights_gb_per_gpu) * 1024)
     mb_per_frame = {"1080": 140, "720": 60, "480": 25}.get(resolution, 60)
     safe_frames  = int(headroom_mb / mb_per_frame) if mb_per_frame > 0 else total_frames
     safe_frames  = _clamp_frames(max(9, safe_frames), model_id)
@@ -165,11 +194,45 @@ def _safe_frames_for_vram(
     if safe_frames < total_frames:
         print(
             f"[gen] VRAM heuristic: capping frames {total_frames} → {safe_frames} "
-            f"({resolution}p @ {total_vram_gb:.0f} GB VRAM, "
+            f"({resolution}p on {per_gpu_vram_gb:.0f} GB GPU with "
+            f"~{weights_gb_per_gpu:.1f} GB of weights, "
             f"~{headroom_mb:.0f} MB activation headroom)"
         )
         return safe_frames
     return total_frames
+
+
+def _retime_frames(frames: list[Image.Image], target_count: int) -> list[Image.Image]:
+    """Blend-interpolate a generated clip to `target_count` frames.
+
+    Used to honour a prompt's duration/fps when the model cannot generate that
+    many frames natively (CogVideoX 1.0: 49 frames = 6.1 s @ 8 fps). Sampling with
+    linear interpolation between neighbouring frames is a cheap temporal
+    cross-dissolve — it keeps motion smooth and needs no extra dependencies like
+    RIFE/FILM, which matters for an offline pipeline.
+    """
+    src_count = len(frames)
+    if target_count <= 0 or src_count == 0 or target_count == src_count:
+        return frames
+
+    positions = np.linspace(0.0, src_count - 1, target_count)
+    out: list[Image.Image] = []
+
+    for pos in positions:
+        lo = int(math.floor(pos))
+        hi = min(lo + 1, src_count - 1)
+        weight = float(pos - lo)
+
+        if weight <= 1e-6 or lo == hi:
+            out.append(frames[lo])
+            continue
+
+        a = np.asarray(frames[lo], dtype=np.float32)
+        b = np.asarray(frames[hi], dtype=np.float32)
+        blended = a * (1.0 - weight) + b * weight
+        out.append(Image.fromarray(blended.astype(np.uint8)))
+
+    return out
 
 
 # ── Core generation ───────────────────────────────────────────────────────────
@@ -179,7 +242,7 @@ def generate_video(
     model_info: dict,
     hw_cfg: dict,
     prompt: str,
-    duration_sec: float = 5.0,
+    duration_sec: float | None = None,
     fps: int | None = None,
     resolution: str | None = None,
     seed: int | None = None,
@@ -195,9 +258,9 @@ def generate_video(
     model_info          : dict from model.MODELS
     hw_cfg              : dict from hardware.detect_device()
     prompt              : user text prompt (may contain quality/res/duration hints)
-    duration_sec        : target video length in seconds
-    fps                 : frames per second (None → auto / prompt hint)
-    resolution          : '480'|'720'|'1080' (None → auto / prompt hint)
+    duration_sec        : target video length in seconds (None → prompt hint, else 10 s)
+    fps                 : frames per second (None → prompt hint / model default)
+    resolution          : '480'|'720'|'1080' (None → prompt hint, else 480p)
     seed                : RNG seed (None → random)
     num_inference_steps : denoising steps (None → auto)
     guidance_scale      : CFG scale
@@ -214,14 +277,21 @@ def generate_video(
         found = ", ".join(f"{k}={v}" for k, v in hints.items())
         print(f"[gen] Prompt hints detected: {found}")
 
-    # ── Resolution: CLI flag > prompt hint > hardware default ────────────
+    # ── Resolution: CLI flag > prompt hint > default (480p) ──────────────
     if resolution is None:
-        resolution = hints.get("resolution") or hw_cfg.get("max_resolution", "720")
+        resolution = hints.get("resolution") or DEFAULT_RESOLUTION
     if resolution not in RESOLUTIONS:
         raise ValueError(f"resolution must be one of {list(RESOLUTIONS.keys())}")
 
-    # ── Duration: CLI flag > prompt hint > default ───────────────────────
-    duration_sec = hints.get("duration_sec", duration_sec)
+    capability = hw_cfg.get("max_resolution")
+    if capability and _RES_ORDER.index(resolution) > _RES_ORDER.index(capability):
+        print(f"[gen] Note: {resolution}p is above the detected capability "
+              f"({capability}p) — this will be slow on "
+              f"{hw_cfg.get('vram_gb', 0):.0f} GB per GPU")
+
+    # ── Duration: CLI flag > prompt hint > default (10 s) ────────────────
+    if duration_sec is None:
+        duration_sec = hints.get("duration_sec", DEFAULT_DURATION_SEC)
     duration_sec = max(1.0, min(60.0, duration_sec))
 
     # ── FPS: CLI flag > prompt hint > model default ──────────────────────
@@ -235,16 +305,25 @@ def generate_video(
         num_inference_steps = max(10, int(base * mult))
 
     # ── Frame count ───────────────────────────────────────────────────────
+    # Frames the model is actually asked for (CogVideoX needs 4k+1) …
     raw_frames   = int(math.ceil(duration_sec * fps))
     total_frames = _clamp_frames(raw_frames, model_id)
 
-    # Apply VRAM safety heuristic when using balanced multi-GPU
-    if use_device_map or (device == "cuda" and total_vram_gb > 0):
+    # … and frames the *file* must contain to play for the requested duration at
+    # the requested fps. The gap is closed by retiming after generation.
+    target_frames = max(1, min(MAX_OUTPUT_FRAMES, int(round(duration_sec * fps))))
+
+    # Apply VRAM safety heuristic when running on CUDA
+    use_shard = use_device_map and hw_cfg.get("gpu_count", 1) > 1
+    if use_shard or (device == "cuda" and total_vram_gb > 0):
+        gpus           = max(1, hw_cfg.get("gpu_count", 1)) if use_shard else 1
+        per_gpu_vram   = hw_cfg.get("vram_gb", total_vram_gb) if use_shard else total_vram_gb
+        weights_per_gpu = _pipeline_weights_gb(model_id) / gpus
         total_frames = _safe_frames_for_vram(
-            total_frames, resolution, total_vram_gb, model_id
+            total_frames, resolution, per_gpu_vram, weights_per_gpu, model_id
         )
 
-    actual_duration = total_frames / fps
+    native_duration = total_frames / fps
     width, height   = RESOLUTIONS[resolution]
 
     # ── Seed ─────────────────────────────────────────────────────────────
@@ -259,7 +338,8 @@ def generate_video(
 
     print(f"[gen] Prompt      : {enhanced_prompt[:80]}{'…' if len(enhanced_prompt) > 80 else ''}")
     print(f"[gen] Resolution  : {width}×{height}  ({resolution}p)")
-    print(f"[gen] Frames      : {total_frames}  ({actual_duration:.1f}s @ {fps} fps)")
+    print(f"[gen] Generate    : {total_frames} frames  ({native_duration:.1f}s @ {fps} fps native)")
+    print(f"[gen] Output clip : {target_frames} frames  ({target_frames / fps:.1f}s @ {fps} fps)")
     print(f"[gen] Steps       : {num_inference_steps}   Guidance: {guidance_scale}")
     print(f"[gen] Device      : {device}  dtype={hw_cfg['dtype']}\n")
 
@@ -287,6 +367,13 @@ def generate_video(
 
     # ── Extract PIL frames ────────────────────────────────────────────────
     pil_frames = _extract_frames(output["result"])
+
+    # ── Retime to the requested duration (blend interpolation) ────────────
+    if target_frames != len(pil_frames):
+        pil_frames = _retime_frames(pil_frames, target_frames)
+        print(f"[gen] Retimed {output['frames_used']} generated frames → "
+              f"{len(pil_frames)} output frames "
+              f"({len(pil_frames) / fps:.1f}s @ {fps} fps, blend interpolation)")
 
     # ── Output path ───────────────────────────────────────────────────────
     if output_path is None:

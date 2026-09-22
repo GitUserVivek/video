@@ -12,9 +12,9 @@ Usage
 Options
 -------
   --model         Model ID (auto if omitted).  See --list-models.
-  --duration      Video length in seconds [default: 5]
-  --fps           Frames per second [default: auto]
-  --resolution    Output resolution: 480 | 720 | 1080 [default: auto]
+  --duration      Video length in seconds [default: prompt hint, else 10]
+  --fps           Frames per second [default: prompt hint, else model native]
+  --resolution    Output resolution: 480 | 720 | 1080 [default: prompt hint, else 480]
   --seed          Random seed for reproducibility
   --steps         Denoising steps [default: auto]
   --guidance      CFG guidance scale [default: 6.0]
@@ -48,12 +48,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model",        default=None,
                    help="Model ID (e.g. cogvideox-2b, cogvideox-5b, ltx-video). "
                         "Auto-selected if omitted.")
-    p.add_argument("--duration",     type=float, default=5.0,
-                   help="Target video duration in seconds (default: 5).")
+    p.add_argument("--duration",     type=float, default=None,
+                   help="Target video duration in seconds. Default: whatever the "
+                        "prompt asks for (e.g. '10 seconds'), else 10.")
     p.add_argument("--fps",          type=int,   default=None,
-                   help="Frames per second (default: auto).")
+                   help="Frames per second. Default: prompt hint, else the model's "
+                        "native rate (8 for CogVideoX).")
     p.add_argument("--resolution",   default=None, choices=["480", "720", "1080"],
-                   help="Output resolution (default: auto from hardware).")
+                   help="Output resolution. Default: prompt hint, else 480p.")
     p.add_argument("--seed",         type=int,   default=None,
                    help="Random seed for reproducibility.")
     p.add_argument("--steps",        type=int,   default=None, dest="num_steps",
@@ -114,7 +116,7 @@ def main() -> int:
               "  Example: python main.py \"a sunset over the ocean\"")
         return 1
 
-    if not (1.0 <= args.duration <= 60.0):
+    if args.duration is not None and not (1.0 <= args.duration <= 60.0):
         print(f"Error: --duration must be between 1 and 60 seconds (got {args.duration}).")
         return 1
 
