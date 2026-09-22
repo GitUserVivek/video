@@ -178,15 +178,29 @@ def select_model(hw_cfg: dict) -> str:
 
 _IGNORE_PATTERNS: dict[str, list[str]] = {
     "Lightricks/LTX-Video": [
+        # ── Old 2B checkpoint versions (superseded by v0.9.5) ────────────
+        "ltx-video-2b-v0.9.safetensors",
+        "ltx-video-2b-v0.9.1.safetensors",
         "ltx-video-2b-v0.9-image-to-video*",
         "ltx-video-2b-v0.9.1-image-to-video*",
-        "ltxv-13b-*",
+        # ── 2B distilled variants ─────────────────────────────────────────
+        "ltxv-2b-0.9.6-dev-04-25.safetensors",
+        "ltxv-2b-0.9.6-distilled-04-25.safetensors",
+        "ltxv-2b-0.9.8-distilled.safetensors",
+        "ltxv-2b-0.9.8-distilled-fp8.safetensors",
+        # ── All 13B variants (too large) ─────────────────────────────────
+        "ltxv-13b-*.safetensors",
+        # ── Upscaler models (not needed for basic t2v) ────────────────────
+        "ltxv-spatial-upscaler-*.safetensors",
+        "ltxv-temporal-upscaler-*.safetensors",
+        # ── Training / media extras ───────────────────────────────────────
         "training/*",
         "finetrainers/*",
-        "*.gguf",
-        "pytorch_model*.bin",
+        "media/*",
         "*.mp4",
         "*.gif",
+        "*.gguf",
+        "pytorch_model*.bin",
     ],
     "THUDM/CogVideoX-2b": [
         "*.bin",
