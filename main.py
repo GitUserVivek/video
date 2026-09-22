@@ -17,9 +17,14 @@ Options
   --resolution    Output resolution: 480 | 720 | 1080 [default: prompt hint, else 480]
   --seed          Random seed for reproducibility
   --steps         Denoising steps [default: auto]
-  --guidance      CFG guidance scale [default: 6.0]
+  --guidance      CFG guidance scale [default: per-model; 6.0 for CogVideoX]
   --output        Output .mp4 file path [default: auto-named]
+  --fast          Fast preset: distilled LTX, 8 steps, no CFG, 24 fps, streaming
+  --stream        Save + play each pass as soon as it finishes [--no-stream to disable]
+  --segment-secs  Cap a single pass to N seconds of footage
+  --preview-every Decode a live preview still every N steps [default: 0 = off]
   --no-compile    Disable torch.compile even when available
+  --benchmark     Measure + compare model paths at one resolution, then exit
   --idle-timeout  Seconds of inactivity before unloading model [default: 180]
   --list-models   Show available models and exit
   --summary       Print hardware summary and exit
@@ -60,15 +65,38 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Random seed for reproducibility.")
     p.add_argument("--steps",        type=int,   default=None, dest="num_steps",
                    help="Number of denoising steps (default: auto).")
-    p.add_argument("--guidance",     type=float, default=6.0,
-                   help="Classifier-free guidance scale (default: 6.0).")
+    p.add_argument("--guidance",     type=float, default=None,
+                   help="Classifier-free guidance scale. Default: the model's own "
+                        "value (6.0 for CogVideoX, 1.0 = off for distilled LTX).")
     p.add_argument("--output",       default=None,
                    help="Output .mp4 path (default: auto-named in current directory).")
+    p.add_argument("--fast",         action="store_true",
+                   help="Fast preset for long clips on small GPUs: distilled LTX-Video, "
+                        "8 steps, no CFG, 480p @ 24 fps, streaming output. Tens of "
+                        "seconds of video in about a minute on 2x T4.")
+    p.add_argument("--stream",       action=argparse.BooleanOptionalAction, default=None,
+                   help="Write and play each generated pass as soon as it finishes "
+                        "instead of waiting for the whole clip (default: on with "
+                        "--fast, off otherwise).")
+    p.add_argument("--segment-secs", type=float, default=None, dest="segment_secs",
+                   help="Cap a single generation pass to N seconds of footage "
+                        "(default: the model's native limit).")
+    p.add_argument("--preview-every", type=int, default=0, dest="preview_every",
+                   help="Decode and show a live preview still every N denoising steps "
+                        "(0 disables; costs ~1-2 s per preview).")
     p.add_argument("--no-compile",   action="store_true",
                    help="Disable torch.compile.")
     p.add_argument("--idle-timeout", type=int, default=180, dest="idle_timeout",
                    help="Seconds of inactivity before unloading model from memory "
                         "(default: 180). Set 0 to disable.")
+    p.add_argument("--benchmark",    action="store_true",
+                   help="Measure each model path (s/step, decode, peak VRAM) and print "
+                        "a side-by-side projection, then exit. No video is written.")
+    p.add_argument("--benchmark-steps", type=int, default=3, dest="benchmark_steps",
+                   help="Denoising steps to probe per model (default: 3).")
+    p.add_argument("--benchmark-models", default=None, dest="benchmark_models",
+                   help="Comma-separated model ids to compare "
+                        "(default: cogvideox-2b,ltx-video-distilled).")
     p.add_argument("--list-models",  action="store_true",
                    help="List available models and exit.")
     p.add_argument("--summary",      action="store_true",
@@ -87,6 +115,33 @@ def _list_models() -> None:
     print()
 
 
+def _apply_fast_preset(args) -> bool:
+    """Fill in --fast defaults for anything the user did not set explicitly.
+
+    Returns the effective `stream` flag (--fast turns it on; --no-stream overrides).
+    """
+    stream = args.stream
+    if args.fast:
+        from generator import FAST_PRESET
+        print(f"[main] --fast preset: {FAST_PRESET['model']}, {FAST_PRESET['steps']} steps, "
+              f"guidance {FAST_PRESET['guidance']}, {FAST_PRESET['resolution']}p @ "
+              f"{FAST_PRESET['fps']} fps, streaming\n")
+        if args.model is None:
+            args.model = FAST_PRESET["model"]
+            if args.num_steps is None: args.num_steps = FAST_PRESET["steps"]
+            if args.guidance is None:  args.guidance = FAST_PRESET["guidance"]
+            if args.fps is None:       args.fps = FAST_PRESET["fps"]
+        elif args.model != FAST_PRESET["model"]:
+            # e.g. --fast --model cogvideox-2b: an 8-step no-CFG schedule on a
+            # non-distilled model looks broken, so keep that model's own schedule.
+            print(f"[main] --fast with --model {args.model}: keeping its own "
+                  f"step/guidance defaults (only resolution + streaming apply)\n")
+        if args.resolution is None: args.resolution = FAST_PRESET["resolution"]
+        if stream is None:          stream = FAST_PRESET["stream"]
+
+    return bool(stream)
+
+
 def main() -> int:
     parser = _build_parser()
     args   = parser.parse_args()
@@ -95,6 +150,8 @@ def main() -> int:
     if args.list_models:
         _list_models()
         return 0
+
+    stream = _apply_fast_preset(args)
 
     # ── Hardware detection ─────────────────────────────────────────────────
     from hardware import detect_device, print_device_summary
@@ -108,6 +165,18 @@ def main() -> int:
         hw_cfg["use_compile"] = False
 
     print_device_summary(hw_cfg)
+
+    # ── Benchmark mode: measure instead of generating ──────────────────────
+    if args.benchmark:
+        from benchmark import run_benchmark
+        run_benchmark(
+            hw_cfg,
+            models=(args.benchmark_models.split(",") if args.benchmark_models else None),
+            steps=args.benchmark_steps,
+            resolution=args.resolution or "480",
+            prompt=args.prompt or "a 480p sunset timelapse, high quality, cinematic lighting",
+        )
+        return 0
 
     # ── Prompt required from here ──────────────────────────────────────────
     if not args.prompt:
@@ -127,7 +196,7 @@ def main() -> int:
     from model import load_pipeline, select_model
     t_load = time.time()
     pipe, model_info = load_pipeline(args.model, hw_cfg)
-    model_id = args.model or select_model(hw_cfg)
+    model_id = model_info.get("model_id") or args.model or select_model(hw_cfg)
     print(f"[main] Model loaded in {time.time() - t_load:.1f}s\n")
 
     # ── Idle watchdog ──────────────────────────────────────────────────────
@@ -173,6 +242,9 @@ def main() -> int:
         num_inference_steps = args.num_steps,
         guidance_scale  = args.guidance,
         output_path     = args.output,
+        stream          = stream,
+        preview_every   = args.preview_every,
+        segment_seconds = args.segment_secs,
     )
 
     # Ping again after generation so the idle clock resets

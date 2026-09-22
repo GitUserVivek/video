@@ -24,6 +24,22 @@ native clip, then *retime* it to `duration × fps` frames by blending adjacent
 frames (see `_retime_frames`). A "10 second" prompt therefore still generates 49
 frames, but the resulting file really is 10 s long at the requested frame rate.
 
+Fast preset
+-----------
+`FAST_PRESET` (CLI `--fast`) swaps in the distilled LTX checkpoint with 8 steps and
+no classifier-free guidance, which is the only configuration that produces tens of
+seconds of video on 2× T4 in roughly a minute. Guidance 1.0 halves the batch; the
+LTX VAE's 32×/8× compression cuts the token count ~5× against CogVideoX.
+
+Live output
+-----------
+`stream=True` splits a long clip into several generation passes and writes + shows
+each one the moment it lands (`<name>_part01.mp4`, …), rather than making the user
+wait for the full clip. Passes are cross-dissolved into the final file. Each pass is
+an independent generation, so a boundary reads as a scene change — ideal for
+timelapse/montage prompts, visible otherwise. `preview_every=N` additionally decodes
+a single latent frame every N steps to show the clip forming.
+
 OOM recovery
 ------------
 When device_map="balanced" (multi-GPU) causes CUDA OOM during inference,
@@ -57,10 +73,24 @@ RESOLUTIONS: dict[str, tuple[int, int]] = {
 DEFAULT_FPS = 8            # CogVideoX native; LTX can do 24 fps
 DEFAULT_RESOLUTION = "480" # 480p is the sweet spot on T4-class GPUs
 DEFAULT_DURATION_SEC = 10.0
-MAX_OUTPUT_FRAMES = 300    # hard cap on retimed output (~37 s @ 8 fps)
+MAX_OUTPUT_FRAMES = 900    # hard cap on retimed output (30 s @ 24 fps fits)
+MAX_SEGMENTS = 8           # cap on chained passes for one long clip
+SEGMENT_FADE = 4           # frames of cross-dissolve hiding a segment boundary
 
 # Resolution tiers, low→high (used to compare a request against GPU capability)
 _RES_ORDER = ["480", "720", "1080"]
+
+# `--fast` preset: the only combination that gets tens of seconds of video out of
+# 2×T4 in roughly a minute. Distilled LTX needs 8 steps and no CFG (guidance 1.0
+# halves the batch); everything else here is about keeping the token count low.
+FAST_PRESET: dict[str, Any] = {
+    "model":      "ltx-video-distilled",
+    "steps":      8,
+    "guidance":   1.0,
+    "fps":        24,
+    "resolution": "480",
+    "stream":     True,
+}
 
 
 # ── Prompt parsing ────────────────────────────────────────────────────────────
@@ -148,11 +178,18 @@ def _negative_prompt() -> str:
 # ── Frame helpers ─────────────────────────────────────────────────────────────
 
 def _clamp_frames(requested: int, model_id: str) -> int:
-    """CogVideoX requires num_frames = 4k+1; LTX is flexible."""
+    """Snap a frame count onto what the model's VAE can actually decode.
+
+    CogVideoX compresses 4× in time → num_frames = 4k+1 (49 = its trained length).
+    LTX compresses 8× → num_frames = 8k+1 (121 / 257 are the published lengths).
+    Anything else is rejected by the VAE or silently padded.
+    """
     if "cogvideox" in model_id:
         k = max(2, min(12, round((requested - 1) / 4)))
         return 4 * k + 1
-    return max(8, min(200, requested))
+
+    k = max(1, min(25, round((requested - 1) / 8)))
+    return 8 * k + 1
 
 
 # Full pipeline footprint in fp16 (transformer + T5-XXL text encoder + VAE).
@@ -235,6 +272,153 @@ def _retime_frames(frames: list[Image.Image], target_count: int) -> list[Image.I
     return out
 
 
+# ── Live / streaming output ───────────────────────────────────────────────────
+
+def _in_notebook() -> bool:
+    try:
+        from IPython import get_ipython
+        return get_ipython() is not None
+    except Exception:
+        return False
+
+
+def _show_video(path: Path) -> None:
+    """Play a finished file inline when running in a notebook (Kaggle/Colab).
+
+    The path is always printed as well — on Kaggle that is what the Output panel
+    serves, so the file is watchable (or downloadable) the moment it is written.
+    """
+    print(f"[live] Ready to watch → {path}")
+    if not _in_notebook():
+        return
+    try:
+        from IPython.display import Video, display
+        try:
+            display(Video(str(path), embed=False, html_attributes="controls loop"))
+        except Exception:
+            display(Video(str(path), embed=True, html_attributes="controls loop"))
+    except Exception:
+        pass
+
+
+def _show_image(path: Path, label: str = "") -> None:
+    """Show a preview still inline (stacked, so earlier previews stay visible)."""
+    print(f"[live] {label}preview → {path}")
+    if not _in_notebook():
+        return
+    try:
+        from IPython.display import Image as IPyImage, display
+        display(IPyImage(filename=str(path), width=480))
+    except Exception:
+        pass
+
+
+def _decode_preview_frame(pipe: Any, latents: torch.Tensor) -> Image.Image | None:
+    """Decode a *single* latent frame straight to RGB — a cheap live preview.
+
+    Decoding one latent frame costs ~1-2 s at 480p versus ~1 min for the whole
+    clip, and uses the same latent normalisation the pipeline applies at the end.
+    """
+    vae = getattr(pipe, "vae", None)
+    if vae is None or latents is None or latents.dim() != 5:
+        return None
+
+    lat = latents[:, :, :1]                       # first latent frame only
+    cfg  = getattr(vae, "config", None)
+    mean = getattr(cfg, "latents_mean", None) if cfg is not None else None
+    std  = getattr(cfg, "latents_std", None) if cfg is not None else None
+    scale = getattr(cfg, "scaling_factor", 1.0) if cfg is not None else 1.0
+
+    if mean is not None and std is not None:      # CogVideoX denormalisation
+        m = torch.tensor(mean, device=lat.device, dtype=lat.dtype).view(1, -1, 1, 1, 1)
+        s = torch.tensor(std, device=lat.device, dtype=lat.dtype).view(1, -1, 1, 1, 1)
+        lat = lat * s + m
+    else:
+        lat = lat / scale
+
+    with torch.no_grad():
+        video = vae.decode(lat.to(vae.dtype), return_dict=False)[0]
+
+    frame = video[0, :, 0].detach().float().cpu()           # (C, H, W), range [-1, 1]
+    arr = ((frame.clamp(-1, 1) + 1) * 127.5).permute(1, 2, 0).numpy().astype(np.uint8)
+    return Image.fromarray(arr)
+
+
+def _make_preview_hook(pipe: Any, every: int, out_dir: Path) -> Any:
+    """Build a `callback_on_step_end` that shows the clip forming step by step."""
+    state = {"failed": False}
+
+    def hook(_pipe: Any, step: int, _timestep: Any, callback_kwargs: dict) -> dict:
+        if state["failed"] or (step + 1) % every != 0:
+            return callback_kwargs
+        latents = callback_kwargs.get("latents")
+        if latents is None:
+            return callback_kwargs
+        try:
+            frame = _decode_preview_frame(_pipe, latents)
+            if frame is not None:
+                path = Path(out_dir) / "preview.jpg"
+                frame.save(path, quality=88)
+                _show_image(path, label=f"step {step + 1} ")
+        except Exception as exc:
+            # Previews are cosmetic: never let them break a long run.
+            state["failed"] = True
+            print(f"[live] live previews disabled ({type(exc).__name__}: {exc})")
+        return callback_kwargs
+
+    return hook
+
+
+# ── Segment planning / assembly ───────────────────────────────────────────────
+
+def _plan_segments(
+    target_frames: int,
+    native_cap: int,
+    stream: bool,
+    model_id: str,
+) -> list[int]:
+    """Split a long clip into per-pass frame counts.
+
+    A single pass is the coherent option (and what retiming is for), but nothing is
+    watchable until it finishes. In stream mode the clip is chained from several
+    independent passes of at most `native_cap` frames each, so every piece is
+    playable the moment it lands. Expect a scene change at each boundary — fine for
+    timelapse/montage prompts, and cross-dissolved to soften it.
+    """
+    if target_frames <= 1:
+        return [max(8, target_frames)]
+    if not stream or target_frames <= native_cap:
+        return [_clamp_frames(min(target_frames, native_cap), model_id)]
+
+    count = min(MAX_SEGMENTS, -(-target_frames // native_cap))
+    base, extra = divmod(target_frames, count)
+    sizes = [base + (1 if i < extra else 0) for i in range(count)]
+    return [_clamp_frames(size, model_id) for size in sizes]
+
+
+def _crossfade_join(prev: list[Image.Image], nxt: list[Image.Image], fade: int = SEGMENT_FADE):
+    """Append `nxt` to `prev`, dissolving the overlap so the cut is not jarring."""
+    if not prev:
+        return list(nxt)
+    fade = max(0, min(fade, len(prev), len(nxt)))
+    if fade == 0:
+        return prev + list(nxt)
+
+    blended = [
+        Image.blend(prev[len(prev) - fade + i].convert("RGB"),
+                    nxt[i].convert("RGB"),
+                    (i + 1) / (fade + 1))
+        for i in range(fade)
+    ]
+    return prev[:-fade] + blended + nxt[fade:]
+
+
+def _model_default(model_info: dict, key: str, fallback: Any) -> Any:
+    """Read a per-model generation default from the registry (model.py)."""
+    value = model_info.get(key)
+    return fallback if value is None else value
+
+
 # ── Core generation ───────────────────────────────────────────────────────────
 
 def generate_video(
@@ -247,8 +431,11 @@ def generate_video(
     resolution: str | None = None,
     seed: int | None = None,
     num_inference_steps: int | None = None,
-    guidance_scale: float = 6.0,
+    guidance_scale: float | None = None,
     output_path: str | None = None,
+    stream: bool = False,
+    preview_every: int = 0,
+    segment_seconds: float | None = None,
 ) -> Path:
     """Run the generation pipeline and write an MP4.
 
@@ -262,12 +449,17 @@ def generate_video(
     fps                 : frames per second (None → prompt hint / model default)
     resolution          : '480'|'720'|'1080' (None → prompt hint, else 480p)
     seed                : RNG seed (None → random)
-    num_inference_steps : denoising steps (None → auto)
-    guidance_scale      : CFG scale
+    num_inference_steps : denoising steps (None → per-model default)
+    guidance_scale      : CFG scale (None → per-model default; 1.0 disables CFG)
     output_path         : destination .mp4 (None → auto-named)
+    stream              : save + show each pass as soon as it finishes
+    preview_every       : decode a live preview still every N steps (0 → off)
+    segment_seconds     : cap a single pass to this many seconds of footage
     """
     device        = hw_cfg["device"]
-    model_id      = model_info.get("repo_id", "").lower()
+    model_id      = (model_info.get("model_id")
+                     or model_info.get("repo_id")
+                     or "").lower()
     total_vram_gb = hw_cfg.get("total_vram_gb", hw_cfg.get("vram_gb", 0))
     use_device_map = hw_cfg.get("use_device_map", False)
 
@@ -296,35 +488,58 @@ def generate_video(
 
     # ── FPS: CLI flag > prompt hint > model default ──────────────────────
     if fps is None:
-        fps = hints.get("fps") or (24 if "ltx" in model_id else DEFAULT_FPS)
+        fps = hints.get("fps") or _model_default(model_info, "default_fps", DEFAULT_FPS)
 
-    # ── Inference steps: CLI flag > quality hint > device default ────────
+    # ── Inference steps: CLI flag > quality hint > model default ────────
     if num_inference_steps is None:
-        base = 25 if device == "cpu" else (30 if device == "mps" else 50)
+        base = _model_default(model_info, "default_steps",
+                              50 if device == "cuda" else 25)
+        if device == "cpu":
+            base = min(base, 25)
+        elif device == "mps":
+            base = min(base, 30)
         mult = hints.get("step_multiplier", 1.0)
-        num_inference_steps = max(10, int(base * mult))
+        num_inference_steps = max(4, int(base * mult))
+
+    # ── Guidance: CLI flag > model default (1.0 = no CFG, e.g. distilled) ─
+    if guidance_scale is None:
+        guidance_scale = _model_default(model_info, "default_guidance", 6.0)
 
     # ── Frame count ───────────────────────────────────────────────────────
-    # Frames the model is actually asked for (CogVideoX needs 4k+1) …
-    raw_frames   = int(math.ceil(duration_sec * fps))
-    total_frames = _clamp_frames(raw_frames, model_id)
-
-    # … and frames the *file* must contain to play for the requested duration at
-    # the requested fps. The gap is closed by retiming after generation.
+    # Frames the *file* must contain to play for the requested duration at the
+    # requested fps.
     target_frames = max(1, min(MAX_OUTPUT_FRAMES, int(round(duration_sec * fps))))
 
-    # Apply VRAM safety heuristic when running on CUDA
+    # A pass can only produce so many in-distribution frames (49 for CogVideoX 1.0,
+    # ~121 for LTX). In stream mode a long clip is chained from several passes so each
+    # piece is watchable the moment it lands; otherwise it is one retimed pass.
+    native_cap = int(_model_default(model_info, "max_native_frames", 49))
+    if segment_seconds:
+        native_cap = min(native_cap, max(8, int(round(segment_seconds * fps))))
+    segment_sizes = _plan_segments(target_frames, native_cap, stream, model_id)
+
+    # Apply VRAM safety heuristic when running on CUDA (per pass, per GPU)
     use_shard = use_device_map and hw_cfg.get("gpu_count", 1) > 1
     if use_shard or (device == "cuda" and total_vram_gb > 0):
-        gpus           = max(1, hw_cfg.get("gpu_count", 1)) if use_shard else 1
-        per_gpu_vram   = hw_cfg.get("vram_gb", total_vram_gb) if use_shard else total_vram_gb
+        gpus            = max(1, hw_cfg.get("gpu_count", 1)) if use_shard else 1
+        per_gpu_vram    = hw_cfg.get("vram_gb", total_vram_gb) if use_shard else total_vram_gb
         weights_per_gpu = _pipeline_weights_gb(model_id) / gpus
-        total_frames = _safe_frames_for_vram(
-            total_frames, resolution, per_gpu_vram, weights_per_gpu, model_id
-        )
+        segment_sizes = [
+            _safe_frames_for_vram(n, resolution, per_gpu_vram, weights_per_gpu, model_id)
+            for n in segment_sizes
+        ]
 
-    native_duration = total_frames / fps
+    generated_total = sum(segment_sizes)
     width, height   = RESOLUTIONS[resolution]
+
+    # ── Output path (resolved up front so each pass can be written/played) ─
+    if output_path is None:
+        safe = "".join(c if c.isalnum() or c in " _-" else "" for c in prompt)
+        safe = safe[:40].strip().replace(" ", "_")
+        output_path = f"output_{safe}_{int(time.time())}.mp4"
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    out_dir = output_path.parent
 
     # ── Seed ─────────────────────────────────────────────────────────────
     generator = None
@@ -335,75 +550,98 @@ def generate_video(
     # ── Prompt ────────────────────────────────────────────────────────────
     enhanced_prompt = _enhance_prompt(prompt)
     negative        = _negative_prompt()
+    preview_hook    = (_make_preview_hook(pipe, preview_every, out_dir)
+                       if preview_every > 0 else None)
 
     print(f"[gen] Prompt      : {enhanced_prompt[:80]}{'…' if len(enhanced_prompt) > 80 else ''}")
     print(f"[gen] Resolution  : {width}×{height}  ({resolution}p)")
-    print(f"[gen] Generate    : {total_frames} frames  ({native_duration:.1f}s @ {fps} fps native)")
+    print(f"[gen] Generate    : {generated_total} frames in {len(segment_sizes)} pass(es) "
+          f"({generated_total / fps:.1f}s @ {fps} fps native)")
     print(f"[gen] Output clip : {target_frames} frames  ({target_frames / fps:.1f}s @ {fps} fps)")
     print(f"[gen] Steps       : {num_inference_steps}   Guidance: {guidance_scale}")
-    print(f"[gen] Device      : {device}  dtype={hw_cfg['dtype']}\n")
+    print(f"[gen] Device      : {device}  dtype={hw_cfg['dtype']}")
+    if stream and len(segment_sizes) > 1:
+        print(f"[gen] Streaming   : every pass is saved and played as it finishes "
+              f"({SEGMENT_FADE}-frame dissolve at each boundary)")
+    if preview_hook is not None:
+        print(f"[gen] Live preview: one decoded frame every {preview_every} steps")
+    print()
 
-    # ── Run with OOM recovery ─────────────────────────────────────────────
-    output = _run_with_oom_recovery(
-        pipe=pipe,
-        model_id=model_id,
-        hw_cfg=hw_cfg,
-        enhanced_prompt=enhanced_prompt,
-        negative=negative,
-        total_frames=total_frames,
-        height=height,
-        width=width,
-        resolution=resolution,
-        fps=fps,
-        num_inference_steps=num_inference_steps,
-        guidance_scale=guidance_scale,
-        generator=generator,
-    )
+    # ── Generate pass by pass; show each one as it lands ─────────────────
+    pil_frames: list[Image.Image] = []
+    for index, seg_target in enumerate(segment_sizes, start=1):
+        if len(segment_sizes) > 1:
+            print(f"\n[gen] ── Pass {index}/{len(segment_sizes)}: {seg_target} frames ──")
+            if generator is not None:
+                # A fixed seed would make every pass byte-identical; offset per pass
+                # so the clip is reproducible yet actually moves.
+                generator.manual_seed(seed + index - 1)
 
-    elapsed = time.time() - output["t0"]
-    frames_count = output["frames_used"]
-    print(f"\n[gen] Generation complete in {elapsed:.1f}s  "
-          f"({elapsed/frames_count:.2f}s/frame)\n")
+        t_pass = time.time()
+        output = _run_with_oom_recovery(
+            pipe=pipe,
+            model_id=model_id,
+            hw_cfg=hw_cfg,
+            enhanced_prompt=enhanced_prompt,
+            negative=negative,
+            total_frames=seg_target,
+            height=height,
+            width=width,
+            resolution=resolution,
+            fps=fps,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            generator=generator,
+            callback=preview_hook,
+        )
 
-    # ── Extract PIL frames ────────────────────────────────────────────────
-    pil_frames = _extract_frames(output["result"])
+        elapsed     = time.time() - t_pass
+        frames_used = output["frames_used"]
+        print(f"\n[gen] Pass {index} done in {elapsed:.1f}s  ({elapsed/frames_used:.2f}s/frame)")
+
+        seg_frames = _extract_frames(output["result"])
+
+        if stream and len(segment_sizes) > 1:
+            part_path = out_dir / f"{output_path.stem}_part{index:02d}.mp4"
+            _write_mp4(seg_frames, part_path, fps)
+            _show_video(part_path)
+
+        pil_frames = _crossfade_join(pil_frames, seg_frames)
 
     # ── Retime to the requested duration (blend interpolation) ────────────
-    if target_frames != len(pil_frames):
+    if len(pil_frames) != target_frames:
+        generated = len(pil_frames)
         pil_frames = _retime_frames(pil_frames, target_frames)
-        print(f"[gen] Retimed {output['frames_used']} generated frames → "
-              f"{len(pil_frames)} output frames "
+        print(f"[gen] Retimed {generated} generated frames → {len(pil_frames)} output frames "
               f"({len(pil_frames) / fps:.1f}s @ {fps} fps, blend interpolation)")
-
-    # ── Output path ───────────────────────────────────────────────────────
-    if output_path is None:
-        safe = "".join(c if c.isalnum() or c in " _-" else "" for c in prompt)
-        safe = safe[:40].strip().replace(" ", "_")
-        output_path = f"output_{safe}_{int(time.time())}.mp4"
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     _write_mp4(pil_frames, output_path, fps)
     print(f"[gen] Saved → {output_path.resolve()}")
+    _show_video(output_path)
     return output_path
 
 
 # ── OOM-safe runner ───────────────────────────────────────────────────────────
 
 def _run_pipeline(pipe, model_id, enhanced_prompt, negative, total_frames,
-                  height, width, num_inference_steps, guidance_scale, generator):
+                  height, width, num_inference_steps, guidance_scale, generator,
+                  callback=None):
     """Single pipeline call — shared by both CogVideoX and LTX."""
+    kwargs = dict(
+        prompt=enhanced_prompt,
+        negative_prompt=negative,
+        num_frames=total_frames,
+        height=height,
+        width=width,
+        num_inference_steps=num_inference_steps,
+        guidance_scale=guidance_scale,
+        generator=generator,
+    )
+    if callback is not None:
+        kwargs["callback_on_step_end"] = callback
+
     with torch.inference_mode():
-        return pipe(
-            prompt=enhanced_prompt,
-            negative_prompt=negative,
-            num_frames=total_frames,
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            generator=generator,
-        )
+        return pipe(**kwargs)
 
 
 def _run_with_oom_recovery(
@@ -411,6 +649,7 @@ def _run_with_oom_recovery(
     enhanced_prompt, negative,
     total_frames, height, width, resolution, fps,
     num_inference_steps, guidance_scale, generator,
+    callback=None,
 ) -> dict:
     """Run pipeline and auto-retry with reduced params on CUDA OOM.
 
@@ -427,6 +666,7 @@ def _run_with_oom_recovery(
             pipe, model_id, enhanced_prompt, negative,
             total_frames, height, width,
             num_inference_steps, guidance_scale, generator,
+            callback=callback,
         )
         return {"result": result, "frames_used": total_frames, "t0": t0}
 
@@ -457,6 +697,7 @@ def _run_with_oom_recovery(
             pipe, model_id, enhanced_prompt, negative,
             new_frames, new_h, new_w,
             num_inference_steps, guidance_scale, generator,
+            callback=callback,
         )
         return {"result": result, "frames_used": new_frames, "t0": t0}
 

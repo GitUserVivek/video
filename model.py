@@ -61,6 +61,11 @@ from diffusers import DiffusionPipeline  # always available
 
 # ── Model registry ────────────────────────────────────────────────────────────
 
+# Per-model generation defaults. `max_native_frames` is how many frames one pass can
+# produce in-distribution: CogVideoX 1.0 is trained on 49 frames, LTX on ~121 — going
+# beyond that yields drift, so longer clips are built from several passes (see
+# generator._plan_segments). `default_guidance == 1.0` means "no classifier-free
+# guidance", which halves the batch and is the whole point of a distilled checkpoint.
 MODELS: dict[str, dict] = {
     "cogvideox-5b": {
         "repo_id":      "THUDM/CogVideoX-5b",
@@ -68,6 +73,10 @@ MODELS: dict[str, dict] = {
         "min_vram":     14,
         "size_label":   "5B",
         "requires_ver": "0.29.0",
+        "default_steps":     50,
+        "default_guidance":  6.0,
+        "default_fps":       8,
+        "max_native_frames": 49,
     },
     "cogvideox-2b": {
         "repo_id":      "THUDM/CogVideoX-2b",
@@ -75,6 +84,10 @@ MODELS: dict[str, dict] = {
         "min_vram":     8,
         "size_label":   "2B",
         "requires_ver": "0.29.0",
+        "default_steps":     50,
+        "default_guidance":  6.0,
+        "default_fps":       8,
+        "max_native_frames": 49,
     },
     "ltx-video": {
         "repo_id":      "Lightricks/LTX-Video",
@@ -82,8 +95,33 @@ MODELS: dict[str, dict] = {
         "min_vram":     4,
         "size_label":   "~2B",
         "requires_ver": "0.32.0",
+        "default_steps":     30,
+        "default_guidance":  3.0,
+        "default_fps":       24,
+        "max_native_frames": 121,
+    },
+    # Few-step distilled LTX: the only realistic way to get tens of seconds of video
+    # out of 2×T4 in about a minute (8 steps, no CFG, ~5× fewer tokens than CogVideoX).
+    "ltx-video-distilled": {
+        "repo_id":      None,      # resolved at load time, see _resolve_repo_id()
+        "pipeline":     "LTXPipeline",
+        "min_vram":     4,
+        "size_label":   "~2B / 8-step",
+        "requires_ver": "0.32.0",
+        "default_steps":     8,
+        "default_guidance":  1.0,
+        "default_fps":       24,
+        "max_native_frames": 121,
     },
 }
+
+# Distilled LTX checkpoints get republished under slightly different names, so probe
+# a small candidate list instead of hard-coding one (LTX_DISTILLED_REPO overrides).
+_LTX_DISTILLED_CANDIDATES: list[str] = [
+    os.environ.get("LTX_DISTILLED_REPO", ""),
+    "Lightricks/LTX-Video-0.9.6-distilled",
+    "Lightricks/LTX-Video-0.9.5-distilled",
+]
 
 # Cache directory
 HF_CACHE = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
@@ -168,6 +206,53 @@ _SIZE_HINTS = {
 }
 
 
+def _patterns_for(repo_id: str) -> list[str]:
+    """Ignore-patterns for a repo, falling back to its family entry.
+
+    Distilled / republished LTX repos carry the same baggage (13B weights, training
+    folders, example media) as `Lightricks/LTX-Video`, so a prefix match stops them
+    from pulling tens of GB of unused files.
+    """
+    if repo_id in _IGNORE_PATTERNS:
+        return _IGNORE_PATTERNS[repo_id]
+    org = repo_id.split("/")[0]
+    for key, patterns in _IGNORE_PATTERNS.items():
+        if key.split("/")[0] == org and repo_id.startswith(key.split("-")[0]):
+            return patterns
+    return []
+
+
+def _resolve_repo_id(model_id: str, info: dict) -> tuple[str | None, dict]:
+    """Resolve a registry entry's HF repo, probing candidates when needed.
+
+    Distilled LTX checkpoints get republished under slightly different names, so a
+    registry entry may leave `repo_id` unset and list candidates instead. If none is
+    reachable (offline, or all probes 404) the entry falls back to its non-distilled
+    sibling — a fast-preset schedule on a non-distilled model looks broken rather
+    than just slow, so the fallback also reverts steps/guidance.
+    """
+    if info.get("repo_id"):
+        return info["repo_id"], info
+
+    for candidate in _LTX_DISTILLED_CANDIDATES:
+        if not candidate:
+            continue
+        try:
+            from huggingface_hub import HfApi
+            HfApi().model_info(candidate)
+            print(f"[model] Distilled checkpoint: {candidate}")
+            return candidate, info
+        except Exception:
+            continue
+
+    print("[model] WARNING: no distilled LTX checkpoint reachable — falling back to "
+          "Lightricks/LTX-Video (more steps required). Set LTX_DISTILLED_REPO=<repo> "
+          "to point at one.")
+    fallback = dict(MODELS["ltx-video"])
+    fallback["resolved_model_id"] = "ltx-video"
+    return fallback["repo_id"], fallback
+
+
 def ensure_model_downloaded(repo_id: str) -> Path:
     """Download only inference-required files. Resumes automatically if interrupted."""
     from huggingface_hub import snapshot_download
@@ -182,7 +267,7 @@ def ensure_model_downloaded(repo_id: str) -> Path:
             print(f"[model] Cache hit: {repo_id}")
             return snapshot_dir
 
-    ignore    = _IGNORE_PATTERNS.get(repo_id, [])
+    ignore    = _patterns_for(repo_id)
     size_hint = _SIZE_HINTS.get(repo_id, "")
     print(f"[model] Downloading {repo_id}  {size_hint}")
     print(f"[model] Cache dir → {snapshot_dir}")
@@ -432,8 +517,10 @@ def load_pipeline(model_id: str | None, hw_cfg: dict) -> tuple[Any, dict]:
 
     _check_version_for_model(model_id)
 
-    info    = MODELS[model_id]
-    repo_id = info["repo_id"]
+    info             = dict(MODELS[model_id])
+    repo_id, info    = _resolve_repo_id(model_id, info)
+    info["repo_id"]  = repo_id                                  # may have been resolved
+    info["model_id"] = info.get("resolved_model_id", model_id)   # survives a fallback
 
     gpu_info = ""
     if hw_cfg.get("use_device_map"):
@@ -451,8 +538,29 @@ def load_pipeline(model_id: str | None, hw_cfg: dict) -> tuple[Any, dict]:
     else:
         cls = None
 
-    pipe = _load_pipeline(repo_id, cls, hw_cfg)
-    pipe = _apply_optimisations(pipe, hw_cfg, model_id)
+    pipe = None
+    if model_id == "ltx-video-distilled":
+        # A republished distilled checkpoint can also load-fail (different component
+        # layout, new pipeline class, …). Fall back instead of ending the session.
+        try:
+            pipe = _load_pipeline(repo_id, cls, hw_cfg)
+        except Exception as exc:
+            print(f"[model] Distilled LTX failed to load ({type(exc).__name__}: {exc})")
+            print("[model] Falling back to Lightricks/LTX-Video with its own schedule")
+            fallback   = dict(MODELS["ltx-video"])
+            repo_id    = fallback["repo_id"]
+            fallback["repo_id"]  = repo_id
+            fallback["model_id"] = "ltx-video"
+            info       = fallback
+            cls        = LTXPipeline
+            ensure_model_downloaded(repo_id)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-    print(f"[model] Ready: {model_id}\n")
+    if pipe is None:
+        pipe = _load_pipeline(repo_id, cls, hw_cfg)
+    pipe = _apply_optimisations(pipe, hw_cfg, info["model_id"])
+
+    print(f"[model] Ready: {info['model_id']}\n")
     return pipe, info
