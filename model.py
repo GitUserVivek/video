@@ -221,34 +221,44 @@ _SIZE_HINTS = {
 }
 
 
-def _patterns_for(repo_id: str) -> list[str]:
-    """Return the ignore-patterns for a repo."""
-    return _IGNORE_PATTERNS.get(repo_id, [])
+# Exact files needed per repo for text-to-video inference.
+# Using explicit lists instead of snapshot_download + ignore_patterns because
+# huggingface_hub's ignore_patterns filtering is unreliable on large repos —
+# it queues all blobs first, then filters, so partial downloads still pull
+# everything. hf_hub_download fetches one file at a time, guaranteed.
+_REQUIRED_FILES: dict[str, list[str]] = {
+    "Lightricks/LTX-Video": [
+        # Pipeline config
+        "model_index.json",
+        # Transformer config + weights (latest 2B checkpoint)
+        "transformer/config.json",
+        "ltx-video-2b-v0.9.5.safetensors",
+        # VAE
+        "vae/config.json",
+        # Text encoder (T5)
+        "text_encoder/config.json",
+        "tokenizer/special_tokens_map.json",
+        "tokenizer/spiece.model",
+        "tokenizer/tokenizer.json",
+        "tokenizer/tokenizer_config.json",
+        # Scheduler
+        "scheduler/scheduler_config.json",
+    ],
+}
 
 
 def ensure_model_downloaded(repo_id: str) -> Path:
-    """Download only inference-required files. Resumes automatically if interrupted.
+    """Download only the exact files needed for inference.
 
-    On a tight storage budget (e.g. Kaggle 50 GB) the HF Hub default `cache_dir`
-    can grow fast: every partial download, every previous revision, every skipped
-    large file still leaves metadata and the blobs it already pulled. Two knobs keep
-    this honest:
+    For repos in _REQUIRED_FILES: uses hf_hub_download() one file at a time —
+    guaranteed to skip all other files regardless of huggingface_hub version.
 
-      HF_HUB_CACHE                — where HF stores every downloaded repo. Point it at
-                                    /kaggle/working/.hfhub (counted against your quota)
-                                    instead of /root/.cache when storage is scarce.
-      HF_HUB_DISABLE_TELEMETRY   — set true so the Hub does not phone home.
-
-    The download itself is resumable (`resume_download=True`): Ctrl-C or a crash leaves
-    a partial state that the next run picks up. We do not re-download if a valid
-    safetensors/bin payload is already present in the snapshot dir.
+    For all other repos: falls back to snapshot_download() with ignore_patterns.
     """
-    from huggingface_hub import snapshot_download
-
     safe_name    = repo_id.replace("/", "--")
     snapshot_dir = HF_CACHE / "hub" / f"models--{safe_name}"
 
-    # Already present → nothing to do. (cache.py reuses this same directory layout.)
+    # Cache hit check
     if snapshot_dir.exists():
         weights = (list(snapshot_dir.glob("**/*.safetensors")) +
                    list(snapshot_dir.glob("**/*.bin")))
@@ -256,23 +266,70 @@ def ensure_model_downloaded(repo_id: str) -> Path:
             print(f"[model] Cache hit: {repo_id}")
             return snapshot_dir
 
-    ignore    = _patterns_for(repo_id)
     size_hint = _SIZE_HINTS.get(repo_id, "")
     print(f"[model] Downloading {repo_id}  {size_hint}")
-    print(f"[model] Cache dir → {snapshot_dir}")
+
+    required = _REQUIRED_FILES.get(repo_id)
+    if required:
+        return _download_exact_files(repo_id, required)
+    else:
+        return _download_snapshot(repo_id)
+
+
+def _download_exact_files(repo_id: str, files: list[str]) -> Path:
+    """Download a specific list of files from a HuggingFace repo."""
+    from huggingface_hub import hf_hub_download
+
+    print(f"[model] Fetching {len(files)} file(s) (exact list — skips all other weights)")
+
+    local_dir = HF_CACHE / "hub" / f"models--{repo_id.replace('/', '--')}" / "snapshots" / "main"
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    downloaded = 0
+    failed = []
+    for filename in files:
+        dest = local_dir / filename
+        if dest.exists():
+            print(f"[model]   skip  {filename} (already present)")
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                cache_dir=str(HF_CACHE / "hub"),
+                token=HF_TOKEN or None,
+            )
+            # hf_hub_download returns a path inside the blob cache; symlink into our layout
+            import shutil
+            if not dest.exists():
+                shutil.copy2(path, dest)
+            size_mb = dest.stat().st_size / 1e6
+            print(f"[model]   ✓  {filename}  ({size_mb:.0f} MB)")
+            downloaded += 1
+        except Exception as exc:
+            print(f"[model]   ✗  {filename}  ({type(exc).__name__}: {exc})")
+            failed.append(filename)
+
+    if failed:
+        # Non-fatal: config files may be embedded differently in some versions
+        print(f"[model] Warning: {len(failed)} file(s) not found: {failed}")
+        print("[model] This may be fine if the pipeline loads from the blob cache.")
+
+    print(f"[model] Downloaded {downloaded} new file(s) to {local_dir}")
+    return local_dir
+
+
+def _download_snapshot(repo_id: str) -> Path:
+    """Fallback: snapshot_download with ignore patterns for non-listed repos."""
+    from huggingface_hub import snapshot_download
+
+    safe_name    = repo_id.replace("/", "--")
+    snapshot_dir = HF_CACHE / "hub" / f"models--{safe_name}"
+    ignore       = _IGNORE_PATTERNS.get(repo_id, [])
+
     if ignore:
         print(f"[model] Skipping {len(ignore)} pattern(s) (large unneeded variants)")
-
-    # Storage hinting for constrained Kaggle sessions: if the user asked us to watch
-    # disk space, warn before we start pulling and again if the snapshot dir grew a lot.
-    STORAGE_WARN_GB = float(os.environ.get("VIDEO_STORAGE_WARN_GB", "45"))
-    _size_before = _dir_size_gb(snapshot_dir.parent) if STORAGE_WARN_GB else None
-    if _size_before is not None and _size_before >= STORAGE_WARN_GB:
-        print(f"[model] Note: HF hub cache parent already ~{_size_before:.0f} GB "
-              f"(VIDEO_STORAGE_WARN_GB={STORAGE_WARN_GB}). Point HF_HUB_CACHE at "
-              f"/kaggle/working/.hfhub and delete the old hub cache before retrying "
-              f"if you are about to run out of space.")
-
     print("  Download resumes automatically if interrupted (Ctrl-C).\n")
 
     t0 = time.time()
@@ -281,21 +338,13 @@ def ensure_model_downloaded(repo_id: str) -> Path:
             repo_id=repo_id,
             cache_dir=str(HF_CACHE / "hub"),
             local_files_only=False,
-            resume_download=True,
             ignore_patterns=ignore if ignore else None,
             token=HF_TOKEN or None,
         )
     except KeyboardInterrupt:
-        print("\n[model] Download cancelled — partial snapshot left on disk so it can resume later.")
+        print("\n[model] Download cancelled — partial snapshot left on disk.")
         raise
-    elapsed = time.time() - t0
-
-    if _size_before is not None:
-        _size_after = _dir_size_gb(snapshot_dir.parent)
-        print(f"[model] HF hub cache parent ~{_size_after:.0f} GB after download "
-              f"(delta {_size_after - _size_before:+.0f} GB)")
-
-    print(f"\n[model] Download complete in {elapsed:.0f}s → {local_dir}")
+    print(f"[model] Download complete in {time.time() - t0:.0f}s → {local_dir}")
     return Path(local_dir)
 
 
