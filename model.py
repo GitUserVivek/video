@@ -94,17 +94,22 @@ def _check_version_for_model(model_id: str) -> None:
 # ── Model selection ───────────────────────────────────────────────────────────
 
 def select_model(hw_cfg: dict) -> str:
-    """Choose the best model ID for the detected hardware."""
+    """Choose the best model ID for the detected hardware.
+
+    VRAM budgets (bfloat16):
+      cogvideox-5b  ~18 GB to reside fully on GPU — only select if >= 18 GB
+      cogvideox-2b  ~10 GB — safe on 10–17 GB cards (T4, 3080, etc.)
+      ltx-video     ~6 GB  — safe on anything < 10 GB, CPU, or MPS
+    """
     device  = hw_cfg["device"]
     vram_gb = hw_cfg.get("vram_gb", 0)
 
-    # Always prefer LTX on CPU/MPS or when diffusers is too old for CogVideoX
     if device in ("cpu", "mps") or not _HAS_COGVIDEOX:
         return "ltx-video"
 
-    if vram_gb >= 14:
+    if vram_gb >= 18:
         return "cogvideox-5b"
-    if vram_gb >= 8:
+    if vram_gb >= 10:
         return "cogvideox-2b"
     return "ltx-video"
 
@@ -193,19 +198,53 @@ def ensure_model_downloaded(repo_id: str) -> Path:
 # ── Pipeline loading ──────────────────────────────────────────────────────────
 
 def _apply_optimisations(pipe: Any, hw_cfg: dict, model_id: str) -> Any:
-    """Apply memory / speed optimisations in-place and return the pipeline."""
+    """Apply memory / speed optimisations and return the pipeline.
+
+    Three-tier VRAM strategy for CUDA:
+      Tier 1 — plenty of VRAM (>= model_full_vram):
+          .to("cuda")  — fastest, everything resident on GPU
+
+      Tier 2 — tight but workable (>= model_min_vram):
+          enable_model_cpu_offload()  — moves whole modules CPU↔GPU as needed,
+          much faster than sequential offload, avoids OOM on T4/3080 class cards
+
+      Tier 3 — low VRAM (< model_min_vram) or sequential_offload flag:
+          enable_sequential_cpu_offload()  — layer-by-layer, slowest but safest
+    """
     device  = hw_cfg["device"]
     vram_gb = hw_cfg.get("vram_gb", 0)
-    offload = hw_cfg.get("sequential_offload", False)
+
+    # Per-model VRAM requirements (bfloat16, approx)
+    _FULL_VRAM = {
+        "cogvideox-5b": 18,   # GB needed to fully reside on GPU
+        "cogvideox-2b": 12,
+        "ltx-video":     8,
+    }
+    _MIN_VRAM = {
+        "cogvideox-5b": 14,   # minimum for model_cpu_offload (rest streams)
+        "cogvideox-2b":  8,
+        "ltx-video":     5,
+    }
+
+    # Normalise model_id to a short key
+    mid = model_id.lower()
+    key = next((k for k in _FULL_VRAM if k in mid), None)
+    full_vram = _FULL_VRAM.get(key, 12)
+    min_vram  = _MIN_VRAM.get(key, 8)
 
     if device == "cuda":
-        if offload or vram_gb < 10:
-            print("[model] Enabling sequential CPU offload (low-VRAM mode)")
-            pipe.enable_sequential_cpu_offload()
-        else:
+        if vram_gb >= full_vram:
+            print(f"[model] {vram_gb:.0f} GB VRAM ≥ {full_vram} GB — loading fully onto GPU")
             pipe = pipe.to(device)
+        elif vram_gb >= min_vram:
+            print(f"[model] {vram_gb:.0f} GB VRAM — using model CPU offload "
+                  f"(need {full_vram} GB for full GPU load)")
+            pipe.enable_model_cpu_offload()
+        else:
+            print(f"[model] {vram_gb:.0f} GB VRAM — using sequential CPU offload (low-VRAM mode)")
+            pipe.enable_sequential_cpu_offload()
 
-        # Attention / VAE slicing reduces peak VRAM with minimal quality loss
+        # These are safe to call regardless of offload mode
         if hasattr(pipe, "enable_attention_slicing"):
             pipe.enable_attention_slicing()
         if hasattr(pipe, "enable_vae_slicing"):
@@ -217,11 +256,16 @@ def _apply_optimisations(pipe: Any, hw_cfg: dict, model_id: str) -> Any:
         pipe = pipe.to(device)
 
     else:  # CPU
-        # sequential_cpu_offload on CPU just keeps peak RAM lower
         pipe.enable_sequential_cpu_offload()
 
-    # torch.compile — only the transformer, only on CUDA
-    if hw_cfg.get("use_compile") and device == "cuda":
+    # torch.compile — only the transformer sub-module, only on CUDA
+    # Skip if model_cpu_offload is active (hooks conflict with compile)
+    compile_ok = (
+        hw_cfg.get("use_compile")
+        and device == "cuda"
+        and vram_gb >= full_vram   # only compile when fully on GPU
+    )
+    if compile_ok:
         transformer = getattr(pipe, "transformer", None)
         if transformer is not None:
             try:

@@ -45,8 +45,10 @@ def detect_device() -> dict:
             "use_compile": True,
             "sequential_offload": vram_gb < 8,   # offload only when VRAM < 8 GB
             "threads": None,
-            "max_resolution": "1080" if vram_gb >= 16 else ("720" if vram_gb >= 8 else "480"),
-            "max_model_size": "14B" if vram_gb >= 12 else ("7B" if vram_gb >= 8 else "1.3B"),
+            # 1080p needs ~18 GB (cogvideox-5b full GPU); 720p safe at 10+ GB
+            "max_resolution": "1080" if vram_gb >= 18 else ("720" if vram_gb >= 10 else "480"),
+            # cogvideox-5b selected at >= 18 GB; cogvideox-2b at >= 10 GB
+            "max_model_size": "14B" if vram_gb >= 18 else ("7B" if vram_gb >= 10 else "1.3B"),
         }
 
     # --------------------------------------------------------------- Apple MPS --
