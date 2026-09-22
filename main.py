@@ -20,6 +20,7 @@ Options
   --guidance      CFG guidance scale [default: 6.0]
   --output        Output .mp4 file path [default: auto-named]
   --no-compile    Disable torch.compile even when available
+  --idle-timeout  Seconds of inactivity before unloading model [default: 180]
   --list-models   Show available models and exit
   --summary       Print hardware summary and exit
 """
@@ -27,6 +28,7 @@ Options
 from __future__ import annotations
 
 import argparse
+import atexit
 import sys
 import time
 from pathlib import Path
@@ -35,7 +37,7 @@ from pathlib import Path
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ai-video",
-        description="Offline AI video generator — GPU (CUDA/ROCm) or CPU",
+        description="Offline AI video generator — GPU (CUDA/ROCm, multi-GPU) or CPU",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -44,7 +46,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    default=None,
                    help="Text description of the video to generate.")
     p.add_argument("--model",        default=None,
-                   help="Model ID (e.g. cogvideox-2b, ltx-video). Auto-selected if omitted.")
+                   help="Model ID (e.g. cogvideox-2b, cogvideox-5b, ltx-video). "
+                        "Auto-selected if omitted.")
     p.add_argument("--duration",     type=float, default=5.0,
                    help="Target video duration in seconds (default: 5).")
     p.add_argument("--fps",          type=int,   default=None,
@@ -61,6 +64,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Output .mp4 path (default: auto-named in current directory).")
     p.add_argument("--no-compile",   action="store_true",
                    help="Disable torch.compile.")
+    p.add_argument("--idle-timeout", type=int, default=180, dest="idle_timeout",
+                   help="Seconds of inactivity before unloading model from memory "
+                        "(default: 180). Set 0 to disable.")
     p.add_argument("--list-models",  action="store_true",
                    help="List available models and exit.")
     p.add_argument("--summary",      action="store_true",
@@ -96,7 +102,6 @@ def main() -> int:
         print_device_summary(hw_cfg)
         return 0
 
-    # Override torch.compile if requested
     if args.no_compile:
         hw_cfg["use_compile"] = False
 
@@ -109,7 +114,6 @@ def main() -> int:
               "  Example: python main.py \"a sunset over the ocean\"")
         return 1
 
-    # ── Validate duration ──────────────────────────────────────────────────
     if not (1.0 <= args.duration <= 60.0):
         print(f"Error: --duration must be between 1 and 60 seconds (got {args.duration}).")
         return 1
@@ -118,15 +122,45 @@ def main() -> int:
     print(f"[main] Prompt: \"{args.prompt}\"")
     print(f"[main] Loading model …\n")
 
-    from model import load_pipeline
+    from model import load_pipeline, select_model
     t_load = time.time()
     pipe, model_info = load_pipeline(args.model, hw_cfg)
+    model_id = args.model or select_model(hw_cfg)
     print(f"[main] Model loaded in {time.time() - t_load:.1f}s\n")
+
+    # ── Idle watchdog ──────────────────────────────────────────────────────
+    guard = None
+    if args.idle_timeout > 0:
+        from idle_guard import IdleGuard
+        guard = IdleGuard(
+            pipe=pipe,
+            hw_cfg=hw_cfg,
+            model_id=model_id,
+            idle_seconds=args.idle_timeout,
+        )
+        guard.start()
+        print(f"[main] Idle watchdog active — model unloads after "
+              f"{args.idle_timeout}s of inactivity\n")
+
+        # Ensure clean shutdown even on Ctrl+C or exception
+        def _cleanup() -> None:
+            if guard is not None:
+                print("\n[main] Shutting down — releasing all resources …")
+                guard.stop()
+        atexit.register(_cleanup)
 
     # ── Generate ───────────────────────────────────────────────────────────
     from generator import generate_video
+
+    # Ping the guard to mark activity start
+    if guard:
+        guard.ping()
+        active_pipe = guard.get_pipe()
+    else:
+        active_pipe = pipe
+
     output_path = generate_video(
-        pipe            = pipe,
+        pipe            = active_pipe,
         model_info      = model_info,
         hw_cfg          = hw_cfg,
         prompt          = args.prompt,
@@ -139,7 +173,25 @@ def main() -> int:
         output_path     = args.output,
     )
 
+    # Ping again after generation so the idle clock resets
+    if guard:
+        guard.ping()
+
     print(f"\n✓ Done!  Video saved to: {output_path.resolve()}\n")
+
+    if guard:
+        print(f"[main] Model will be unloaded automatically after "
+              f"{args.idle_timeout}s of inactivity.\n"
+              f"       Press Ctrl+C to exit and release resources immediately.\n")
+        # Keep the process alive so the watchdog can fire if the user
+        # wants to run another generation interactively.
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n[main] Interrupted — releasing resources …")
+            guard.stop()
+
     return 0
 
 

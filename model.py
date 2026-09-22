@@ -11,6 +11,14 @@ Diffusers version compatibility
   CogVideoXPipeline  → diffusers >= 0.29.0
   LTXPipeline        → diffusers >= 0.32.0
   Fallback           → DiffusionPipeline.from_pretrained() works with any version
+
+Multi-GPU
+---------
+  When hw_cfg["use_device_map"] is True (multiple CUDA GPUs detected),
+  from_pretrained() is called with device_map="auto". Accelerate then
+  shards the model across all available GPUs automatically — no manual
+  tensor splitting required. On 2× T4 (2× 15.6 GB = ~31 GB total) this
+  allows running cogvideox-5b (~18 GB) fully in VRAM.
 """
 
 from __future__ import annotations
@@ -73,14 +81,13 @@ MODELS: dict[str, dict] = {
     },
 }
 
-# Cache directory – mirrors HuggingFace default but explicit
+# Cache directory
 HF_CACHE = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
 
 
 # ── Version guard ─────────────────────────────────────────────────────────────
 
 def _check_version_for_model(model_id: str) -> None:
-    """Raise a clear error if diffusers is too old for the requested model."""
     required = MODELS[model_id].get("requires_ver", "0.0.0")
     if _DIFFUSERS_VER < Version(required):
         raise RuntimeError(
@@ -94,49 +101,45 @@ def _check_version_for_model(model_id: str) -> None:
 # ── Model selection ───────────────────────────────────────────────────────────
 
 def select_model(hw_cfg: dict) -> str:
-    """Choose the best model ID for the detected hardware.
+    """Choose the best model for the detected hardware.
+
+    Uses total_vram_gb (sum across all GPUs) so that e.g. 2× T4 = 31 GB
+    correctly unlocks cogvideox-5b.
 
     VRAM budgets (bfloat16):
-      cogvideox-5b  ~18 GB to reside fully on GPU — only select if >= 18 GB
-      cogvideox-2b  ~10 GB — safe on 10–17 GB cards (T4, 3080, etc.)
-      ltx-video     ~6 GB  — safe on anything < 10 GB, CPU, or MPS
+      cogvideox-5b  ~18 GB   — safe when total_vram_gb >= 18
+      cogvideox-2b  ~10 GB   — safe when total_vram_gb >= 10
+      ltx-video     ~6 GB    — everything else, CPU, MPS
     """
-    device  = hw_cfg["device"]
-    vram_gb = hw_cfg.get("vram_gb", 0)
+    device     = hw_cfg["device"]
+    total_vram = hw_cfg.get("total_vram_gb", hw_cfg.get("vram_gb", 0))
 
     if device in ("cpu", "mps") or not _HAS_COGVIDEOX:
         return "ltx-video"
 
-    if vram_gb >= 18:
+    if total_vram >= 18:
         return "cogvideox-5b"
-    if vram_gb >= 10:
+    if total_vram >= 10:
         return "cogvideox-2b"
     return "ltx-video"
 
 
 # ── Download helpers ──────────────────────────────────────────────────────────
 
-
-# Files to skip per repo — large extras that are NOT needed for text-to-video inference
 _IGNORE_PATTERNS: dict[str, list[str]] = {
     "Lightricks/LTX-Video": [
-        # image-to-video variants (separate checkpoints, not needed for t2v)
         "ltx-video-2b-v0.9-image-to-video*",
         "ltx-video-2b-v0.9.1-image-to-video*",
-        "ltxv-13b-*",               # 13B variant — too large for CPU
-        # training / fine-tuning helpers
+        "ltxv-13b-*",
         "training/*",
         "finetrainers/*",
-        # GGUF quantised weights (we use bfloat16 safetensors directly)
         "*.gguf",
-        # old numbered-shard bin files (superseded by safetensors)
         "pytorch_model*.bin",
-        # large video samples bundled in the repo
         "*.mp4",
         "*.gif",
     ],
     "THUDM/CogVideoX-2b": [
-        "*.bin",          # safetensors are preferred
+        "*.bin",
         "*.msgpack",
         "flax_model*",
     ],
@@ -147,15 +150,15 @@ _IGNORE_PATTERNS: dict[str, list[str]] = {
     ],
 }
 
+_SIZE_HINTS = {
+    "Lightricks/LTX-Video": "~8 GB  (text-to-video weights only)",
+    "THUDM/CogVideoX-2b":   "~16 GB",
+    "THUDM/CogVideoX-5b":   "~30 GB",
+}
+
 
 def ensure_model_downloaded(repo_id: str) -> Path:
-    """Download only the inference-required files from HuggingFace.
-
-    Uses snapshot_download() with ignore_patterns to skip large extras
-    (image-to-video checkpoints, training scripts, GGUF weights, etc.).
-    Downloads always resume if interrupted.
-    Returns the local snapshot directory path.
-    """
+    """Download only inference-required files. Resumes automatically if interrupted."""
     from huggingface_hub import snapshot_download
 
     safe_name    = repo_id.replace("/", "--")
@@ -168,20 +171,13 @@ def ensure_model_downloaded(repo_id: str) -> Path:
             print(f"[model] Cache hit: {repo_id}")
             return snapshot_dir
 
-    ignore = _IGNORE_PATTERNS.get(repo_id, [])
-
-    # Estimate download size for the user
-    _SIZE_HINTS = {
-        "Lightricks/LTX-Video":  "~8 GB  (text-to-video weights only)",
-        "THUDM/CogVideoX-2b":    "~16 GB",
-        "THUDM/CogVideoX-5b":    "~30 GB",
-    }
+    ignore    = _IGNORE_PATTERNS.get(repo_id, [])
     size_hint = _SIZE_HINTS.get(repo_id, "")
     print(f"[model] Downloading {repo_id}  {size_hint}")
     print(f"[model] Cache dir → {snapshot_dir}")
     if ignore:
-        print(f"[model] Skipping {len(ignore)} ignore pattern(s) to avoid large unneeded files")
-    print("  Download will resume automatically if interrupted.\n")
+        print(f"[model] Skipping {len(ignore)} pattern(s) (large unneeded variants)")
+    print("  Download resumes automatically if interrupted.\n")
 
     t0 = time.time()
     local_dir = snapshot_download(
@@ -197,54 +193,77 @@ def ensure_model_downloaded(repo_id: str) -> Path:
 
 # ── Pipeline loading ──────────────────────────────────────────────────────────
 
+def _load_pipeline(repo_id: str, pipeline_cls: Any, hw_cfg: dict) -> Any:
+    """Load pipeline with device_map="auto" (multi-GPU) or plain dtype load (single)."""
+    dtype          = hw_cfg["dtype"]
+    use_device_map = hw_cfg.get("use_device_map", False)
+    gpu_count      = hw_cfg.get("gpu_count", 1)
+    loader         = pipeline_cls if pipeline_cls is not None else DiffusionPipeline
+    cls_name       = loader.__name__ if loader else "DiffusionPipeline"
+
+    if use_device_map:
+        print(f"[model] Loading {cls_name} ({dtype}) across {gpu_count} GPUs "
+              f"with device_map='auto' …")
+        pipe = loader.from_pretrained(
+            repo_id,
+            torch_dtype=dtype,
+            cache_dir=str(HF_CACHE / "hub"),
+            device_map="auto",          # Accelerate shards across all GPUs
+        )
+    else:
+        print(f"[model] Loading {cls_name} ({dtype}) …")
+        pipe = loader.from_pretrained(
+            repo_id,
+            torch_dtype=dtype,
+            cache_dir=str(HF_CACHE / "hub"),
+        )
+
+    return pipe
+
+
 def _apply_optimisations(pipe: Any, hw_cfg: dict, model_id: str) -> Any:
     """Apply memory / speed optimisations and return the pipeline.
 
-    Three-tier VRAM strategy for CUDA:
-      Tier 1 — plenty of VRAM (>= model_full_vram):
-          .to("cuda")  — fastest, everything resident on GPU
+    Multi-GPU path (use_device_map=True):
+        device_map="auto" already placed all tensors — skip .to() and offload
+        calls entirely. Only add attention/VAE slicing.
 
-      Tier 2 — tight but workable (>= model_min_vram):
-          enable_model_cpu_offload()  — moves whole modules CPU↔GPU as needed,
-          much faster than sequential offload, avoids OOM on T4/3080 class cards
-
-      Tier 3 — low VRAM (< model_min_vram) or sequential_offload flag:
-          enable_sequential_cpu_offload()  — layer-by-layer, slowest but safest
+    Single-GPU path — three tiers by VRAM:
+        Tier 1 (>= full_vram GB) : .to("cuda")
+        Tier 2 (>= min_vram GB)  : enable_model_cpu_offload()
+        Tier 3 (< min_vram GB)   : enable_sequential_cpu_offload()
     """
-    device  = hw_cfg["device"]
-    vram_gb = hw_cfg.get("vram_gb", 0)
+    device         = hw_cfg["device"]
+    vram_gb        = hw_cfg.get("vram_gb", 0)
+    total_vram_gb  = hw_cfg.get("total_vram_gb", vram_gb)
+    use_device_map = hw_cfg.get("use_device_map", False)
 
-    # Per-model VRAM requirements (bfloat16, approx)
-    _FULL_VRAM = {
-        "cogvideox-5b": 18,   # GB needed to fully reside on GPU
-        "cogvideox-2b": 12,
-        "ltx-video":     8,
-    }
-    _MIN_VRAM = {
-        "cogvideox-5b": 14,   # minimum for model_cpu_offload (rest streams)
-        "cogvideox-2b":  8,
-        "ltx-video":     5,
-    }
+    # Per-model VRAM thresholds (bfloat16, approximate)
+    _FULL_VRAM = {"cogvideox-5b": 18, "cogvideox-2b": 12, "ltx-video": 8}
+    _MIN_VRAM  = {"cogvideox-5b": 14, "cogvideox-2b":  8, "ltx-video": 5}
 
-    # Normalise model_id to a short key
-    mid = model_id.lower()
-    key = next((k for k in _FULL_VRAM if k in mid), None)
+    mid      = model_id.lower()
+    key      = next((k for k in _FULL_VRAM if k in mid), None)
     full_vram = _FULL_VRAM.get(key, 12)
     min_vram  = _MIN_VRAM.get(key, 8)
 
     if device == "cuda":
-        if vram_gb >= full_vram:
+        if use_device_map:
+            # Model is already distributed across GPUs by Accelerate — nothing to move
+            print(f"[model] Multi-GPU: model sharded across {hw_cfg['gpu_count']} GPUs "
+                  f"({total_vram_gb:.0f} GB total VRAM)")
+        elif vram_gb >= full_vram:
             print(f"[model] {vram_gb:.0f} GB VRAM ≥ {full_vram} GB — loading fully onto GPU")
             pipe = pipe.to(device)
         elif vram_gb >= min_vram:
             print(f"[model] {vram_gb:.0f} GB VRAM — using model CPU offload "
-                  f"(need {full_vram} GB for full GPU load)")
+                  f"(need {full_vram} GB for full GPU)")
             pipe.enable_model_cpu_offload()
         else:
-            print(f"[model] {vram_gb:.0f} GB VRAM — using sequential CPU offload (low-VRAM mode)")
+            print(f"[model] {vram_gb:.0f} GB VRAM — using sequential CPU offload")
             pipe.enable_sequential_cpu_offload()
 
-        # These are safe to call regardless of offload mode
+        # Attention / VAE slicing: safe with all placement strategies
         if hasattr(pipe, "enable_attention_slicing"):
             pipe.enable_attention_slicing()
         if hasattr(pipe, "enable_vae_slicing"):
@@ -258,12 +277,13 @@ def _apply_optimisations(pipe: Any, hw_cfg: dict, model_id: str) -> Any:
     else:  # CPU
         pipe.enable_sequential_cpu_offload()
 
-    # torch.compile — only the transformer sub-module, only on CUDA
-    # Skip if model_cpu_offload is active (hooks conflict with compile)
+    # torch.compile — only when model is fully on a single GPU
+    # device_map="auto" and torch.compile conflict (different dispatch mechanisms)
     compile_ok = (
         hw_cfg.get("use_compile")
         and device == "cuda"
-        and vram_gb >= full_vram   # only compile when fully on GPU
+        and not use_device_map
+        and vram_gb >= full_vram
     )
     if compile_ok:
         transformer = getattr(pipe, "transformer", None)
@@ -281,30 +301,15 @@ def _apply_optimisations(pipe: Any, hw_cfg: dict, model_id: str) -> Any:
     return pipe
 
 
-def _load_pipeline(repo_id: str, pipeline_cls: Any, hw_cfg: dict) -> Any:
-    """Generic loader: from_pretrained → optimisations."""
-    dtype = hw_cfg["dtype"]
-    print(f"[model] Loading {pipeline_cls.__name__ if pipeline_cls else 'DiffusionPipeline'} "
-          f"({dtype}) …")
-
-    loader = pipeline_cls if pipeline_cls is not None else DiffusionPipeline
-    pipe   = loader.from_pretrained(
-        repo_id,
-        torch_dtype=dtype,
-        cache_dir=str(HF_CACHE / "hub"),
-    )
-    return pipe
-
-
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def load_pipeline(model_id: str | None, hw_cfg: dict) -> tuple[Any, dict]:
-    """Download (if needed) and load the appropriate video generation pipeline.
+    """Download (if needed) and load the video generation pipeline.
 
     Parameters
     ----------
     model_id : str | None
-        One of the keys in MODELS, or None to auto-select.
+        Key from MODELS, or None to auto-select based on hw_cfg.
     hw_cfg : dict
         Config dict from hardware.detect_device().
 
@@ -320,18 +325,19 @@ def load_pipeline(model_id: str | None, hw_cfg: dict) -> tuple[Any, dict]:
             f"Unknown model '{model_id}'. Choose from: {list(MODELS.keys())}"
         )
 
-    # Hard stop with a clear upgrade message if diffusers is too old
     _check_version_for_model(model_id)
 
     info    = MODELS[model_id]
     repo_id = info["repo_id"]
 
-    print(f"[model] Selected: {model_id} ({info['size_label']})  repo={repo_id}")
+    gpu_info = ""
+    if hw_cfg.get("use_device_map"):
+        gpu_info = f"  [sharded across {hw_cfg['gpu_count']} GPUs, " \
+                   f"{hw_cfg['total_vram_gb']:.0f} GB total]"
+    print(f"[model] Selected: {model_id} ({info['size_label']})  repo={repo_id}{gpu_info}")
 
-    # Ensure weights are cached locally
     ensure_model_downloaded(repo_id)
 
-    # Pick the right class (or None → DiffusionPipeline fallback)
     pipeline_name = info["pipeline"]
     if pipeline_name == "CogVideoXPipeline":
         cls = CogVideoXPipeline
@@ -340,10 +346,7 @@ def load_pipeline(model_id: str | None, hw_cfg: dict) -> tuple[Any, dict]:
     else:
         cls = None
 
-    # Load from cache
     pipe = _load_pipeline(repo_id, cls, hw_cfg)
-
-    # Memory / speed optimisations
     pipe = _apply_optimisations(pipe, hw_cfg, model_id)
 
     print(f"[model] Ready: {model_id}\n")
