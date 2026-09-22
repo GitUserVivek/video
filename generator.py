@@ -92,13 +92,13 @@ SEGMENT_FADE = 4           # frames of cross-dissolve hiding a segment boundary
 # Resolution tiers, low→high (used to compare a request against GPU capability)
 _RES_ORDER = ["480", "720", "1080"]
 
-# `--fast` preset: the only combination that gets tens of seconds of video out of
-# 2×T4 in roughly a minute. Distilled LTX needs 8 steps and no CFG (guidance 1.0
-# halves the batch); everything else here is about keeping the token count low.
+# `--fast` preset: use ltx-video (already downloaded, ~8 GB) with reduced steps.
+# Distilled checkpoints are not bundled because they require a separate HF repo
+# that changes frequently — point LTX_DISTILLED_REPO at one if you have it.
 FAST_PRESET: dict[str, Any] = {
-    "model":      "ltx-video-distilled",
-    "steps":      8,
-    "guidance":   1.0,
+    "model":      "ltx-video",
+    "steps":      20,
+    "guidance":   3.0,
     "fps":        24,
     "resolution": "480",
     "stream":     True,
