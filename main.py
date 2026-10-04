@@ -115,6 +115,21 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="List available models and exit.")
     p.add_argument("--summary",      action="store_true",
                    help="Print hardware summary and exit.")
+
+    # ── Persistent server flags ────────────────────────────────────────────
+    p.add_argument("--release-resources", action="store_true",
+                   dest="release_resources",
+                   help="Tell the running model server to unload the pipeline from "
+                        "GPU memory, then exit. The server process stays alive so "
+                        "the next run does not need to restart it.")
+    p.add_argument("--reset",        action="store_true",
+                   help="Tell the running model server to release GPU memory AND "
+                        "shut down completely, then exit.")
+    p.add_argument("--server-status", action="store_true", dest="server_status",
+                   help="Print the model server's current status and exit.")
+    p.add_argument("--no-server",    action="store_true", dest="no_server",
+                   help="Disable the persistent server — load the model inline "
+                        "(old behaviour, model is lost on exit/crash).")
     return p
 
 
@@ -170,6 +185,33 @@ def main() -> int:
     if args.list_models:
         _list_models()
         return 0
+
+    # ── Server control flags (no model loading needed) ─────────────────────
+    if args.reset or args.release_resources or args.server_status:
+        from model_server import is_server_running
+        from server_client import (
+            print_status, release_resources, shutdown_server,
+        )
+        if not is_server_running():
+            print("[main] Model server is not running.")
+            return 0
+
+        if args.server_status:
+            print_status()
+            return 0
+
+        if args.release_resources:
+            print("[main] Releasing GPU memory (server stays alive) …")
+            release_resources()
+            print("[main] Done. Re-run any generation command to reload the model.")
+            return 0
+
+        if args.reset:
+            print("[main] Releasing resources and stopping server …")
+            release_resources()
+            shutdown_server()
+            print("[main] Server stopped.")
+            return 0
 
     stream = _apply_fast_preset(args)
 
@@ -252,8 +294,52 @@ def main() -> int:
         print(f"Error: --duration must be between 1 and 60 seconds (got {args.duration}).")
         return 1
 
-    # ── Load model ─────────────────────────────────────────────────────────
     print(f"[main] Prompt: \"{args.prompt}\"")
+
+    # ── Persistent server mode (default) ──────────────────────────────────
+    if not args.no_server:
+        return _run_via_server(args, stream, hw_cfg)
+
+    # ── Inline mode (--no-server) — old behaviour ─────────────────────────
+    return _run_inline(args, stream, hw_cfg)
+
+
+def _run_via_server(args, stream: bool, hw_cfg: dict) -> int:
+    """Delegate generation to the persistent model server."""
+    from server_client import ensure_server_running, generate
+
+    # Auto-start the server if it isn't running yet
+    ensure_server_running(model_id=args.model)
+
+    try:
+        output_path = generate(
+            prompt              = args.prompt,
+            model               = args.model,
+            duration_sec        = args.duration,
+            fps                 = args.fps,
+            resolution          = args.resolution,
+            seed                = args.seed,
+            num_inference_steps = args.num_steps,
+            guidance_scale      = args.guidance,
+            output_path         = args.output,
+            stream              = stream,
+            preview_every       = args.preview_every,
+            segment_seconds     = args.segment_secs,
+            cache_dir           = args.cache_dir,
+            resume              = not args.no_resume,
+        )
+        print(f"\n✓ Done!  Video saved to: {output_path.resolve()}\n")
+        print("[main] Model stays loaded in GPU memory for the next run.\n"
+              "       python main.py --release-resources   — free GPU memory\n"
+              "       python main.py --reset               — stop server entirely\n")
+        return 0
+    except RuntimeError as exc:
+        print(f"\nError: {exc}")
+        return 1
+
+
+def _run_inline(args, stream: bool, hw_cfg: dict) -> int:
+    """Load model in-process and generate (original behaviour, model lost on exit)."""
     print(f"[main] Loading model …\n")
 
     from model import load_pipeline, select_model
@@ -276,7 +362,6 @@ def main() -> int:
         print(f"[main] Idle watchdog active — model unloads after "
               f"{args.idle_timeout}s of inactivity\n")
 
-        # Ensure clean shutdown even on Ctrl+C or exception
         def _cleanup() -> None:
             if guard is not None:
                 print("\n[main] Shutting down — releasing all resources …")
@@ -286,7 +371,6 @@ def main() -> int:
     # ── Generate ───────────────────────────────────────────────────────────
     from generator import generate_video
 
-    # Ping the guard to mark activity start
     if guard:
         guard.ping()
         active_pipe = guard.get_pipe()
@@ -305,14 +389,12 @@ def main() -> int:
         num_inference_steps = args.num_steps,
         guidance_scale  = args.guidance,
         output_path     = args.output,
-        # stream          = stream,
         preview_every   = args.preview_every,
         segment_seconds = args.segment_secs,
         cache_dir       = args.cache_dir,
         resume          = not args.no_resume,
     )
 
-    # Ping again after generation so the idle clock resets
     if guard:
         guard.ping()
 
@@ -322,8 +404,6 @@ def main() -> int:
         print(f"[main] Model will be unloaded automatically after "
               f"{args.idle_timeout}s of inactivity.\n"
               f"       Press Ctrl+C to exit and release resources immediately.\n")
-        # Keep the process alive so the watchdog can fire if the user
-        # wants to run another generation interactively.
         try:
             while True:
                 time.sleep(1)
