@@ -611,20 +611,25 @@ def _try_enable_xformers(pipe: Any) -> bool:
     return False
 
 
-def _apply_chunked_attention(pipe: Any, vram_gb: float) -> bool:
+def _apply_chunked_attention(pipe: Any, vram_gb: float,
+                             chunk_size_override: int | None = None) -> bool:
     """Apply chunked attention patch as fallback when xformers is unavailable.
 
     `chunk_size` caps how many query tokens are scored per iteration; the kernel
-    additionally clamps it so a single score block stays under ~512 MB (CogVideoX
-    runs joint text+video attention, so a 480p/49-frame pass would otherwise need
-    ~52 GB for one block's fp32 score matrix).
+    additionally clamps it so a single score block stays under ~512 MB.
+
+    chunk_size_override: when set, bypasses the vram-based selection entirely.
+    Use a value equal to the full sequence length to get a single-pass (no loop,
+    no cross-GPU overhead) while still going through the wrapper.
       T4 15 GB  → chunk_size=512
       8 GB GPU  → chunk_size=256
       ≥24 GB    → chunk_size=2048 (fast)
     """
     try:
         from chunked_attention import patch_cogvideox_attention
-        if vram_gb >= 24:
+        if chunk_size_override is not None:
+            chunk = chunk_size_override
+        elif vram_gb >= 24:
             chunk = 2048
         elif vram_gb >= 12:
             chunk = 512
@@ -731,13 +736,37 @@ def _apply_optimisations(pipe: Any, hw_cfg: dict, model_id: str) -> Any:
 
     if device == "cuda":
         # ── Step 1: fix attention BEFORE placement ─────────────────────────
-        is_cogvideox = "cogvideox" in mid
+        is_cogvideox  = "cogvideox" in mid
+        is_multi_gpu  = hw_cfg.get("use_device_map", False) and gpu_count > 1
+        is_2b         = "cogvideox-2b" in mid
+
         if is_cogvideox:
             xformers_ok = _try_enable_xformers(pipe)
             if not xformers_ok:
-                chunked_ok = _apply_chunked_attention(pipe, vram_gb)
-                if not chunked_ok:
-                    print("[model] WARNING: no attention fix applied — OOM likely")
+                if is_multi_gpu and is_2b:
+                    # cogvideox-2b on multi-GPU with device_map="balanced":
+                    # Chunked attention is still needed to avoid the N² score matrix
+                    # OOM (720p/49 frames → ~14k tokens → 7 GB score matrix).
+                    # BUT: small chunks (512) cause extreme slowdown because every
+                    # chunk iteration triggers accelerate's AlignDevicesHook
+                    # (cross-GPU tensor copy). 14400/512 = 28 iters × 30 layers
+                    # × cross-GPU sync ≈ 3-5 min/step.
+                    #
+                    # Fix: use ONE large chunk = full sequence length.
+                    # This makes chunked attention behave identically to native
+                    # SDPA (single matmul, no loop overhead) while still going
+                    # through our wrapper. The score matrix peaks at ~512 MB
+                    # which fits fine on T4 with weights sharded.
+                    seq_len    = 14626   # 720p/49f tokens (text + video)
+                    chunk_size = seq_len  # single chunk = no loop overhead
+                    print(f"[model] Multi-GPU + cogvideox-2b: chunked attention "
+                          f"with chunk_size={chunk_size} (single pass, no sync overhead)")
+                    _apply_chunked_attention(pipe, vram_gb,
+                                             chunk_size_override=chunk_size)
+                else:
+                    chunked_ok = _apply_chunked_attention(pipe, vram_gb)
+                    if not chunked_ok:
+                        print("[model] WARNING: no attention fix applied — OOM likely")
 
         # ── Step 2: placement ──────────────────────────────────────────────
         if hw_cfg.get("use_device_map") and gpu_count > 1:
