@@ -166,7 +166,7 @@ def detect_device() -> dict:
 
 
 def print_device_summary(cfg: dict) -> None:
-    """Pretty-print the hardware config for the user."""
+    """Pretty-print the hardware config and current available resources."""
     print("\n── Hardware Configuration ──────────────────────────────")
     print(f"  Device            : {cfg['device'].upper()}")
     print(f"  Dtype             : {cfg['dtype']}")
@@ -189,6 +189,44 @@ def print_device_summary(cfg: dict) -> None:
     print(f"  Max model size    : {cfg['max_model_size']}")
     print(f"  torch.compile     : {'yes' if cfg['use_compile'] else 'no'}")
     print(f"  Sequential offload: {'yes' if cfg['sequential_offload'] else 'no'}")
+
+    # ── Live resource snapshot ─────────────────────────────────────────────
+    print("── Available Resources ─────────────────────────────────")
+    try:
+        import psutil
+        ram   = psutil.virtual_memory()
+        cpu_p = psutil.cpu_percent(interval=0.2)
+        print(f"  CPU usage         : {cpu_p:.0f}%  "
+              f"({(os.cpu_count() or 1)} logical cores)")
+        print(f"  RAM free          : {ram.available / 1e9:.1f} / "
+              f"{ram.total / 1e9:.1f} GB  ({100 - ram.percent:.0f}% free)")
+    except ImportError:
+        print("  RAM / CPU         : install psutil for live stats")
+
+    try:
+        import psutil, shutil as _shutil
+        # Use /kaggle/working if it exists (Kaggle), else cwd
+        disk_path = "/kaggle/working" if os.path.exists("/kaggle/working") else "."
+        disk = _shutil.disk_usage(disk_path)
+        print(f"  Disk free ({disk_path:<14}): "
+              f"{disk.free / 1e9:.1f} / {disk.total / 1e9:.1f} GB  "
+              f"({disk.free * 100 // disk.total:.0f}% free)")
+    except Exception:
+        pass
+
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            free_b, total_b = torch.cuda.mem_get_info(i)
+            free_gb  = free_b  / 1e9
+            total_gb = total_b / 1e9
+            used_gb  = total_gb - free_gb
+            bar_len  = 20
+            used_bars = int(bar_len * used_gb / total_gb)
+            bar = "█" * used_bars + "░" * (bar_len - used_bars)
+            name = torch.cuda.get_device_name(i)
+            print(f"  GPU {i} ({name[:18]:<18}): "
+                  f"{free_gb:.1f} GB free / {total_gb:.1f} GB  "
+                  f"[{bar}] {used_gb / total_gb * 100:.0f}% used")
     print("────────────────────────────────────────────────────────\n")
 
 

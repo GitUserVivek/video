@@ -385,8 +385,107 @@ def _decode_preview_frame(pipe: Any, latents: torch.Tensor) -> Image.Image | Non
     return Image.fromarray(arr)
 
 
+def _vram_snapshot() -> str:
+    """One-line VRAM free summary across all GPUs."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return ""
+        parts = []
+        for i in range(torch.cuda.device_count()):
+            free = torch.cuda.mem_get_info(i)[0] / 1e9
+            parts.append(f"GPU{i}: {free:.1f}GB free")
+        return "  " + " | ".join(parts)
+    except Exception:
+        return ""
+
+
+def _make_progress_callback(total_steps: int, total_frames: int, pass_label: str) -> Any:
+    """Build a callback_on_step_end that logs step progress, ETA, and VRAM.
+
+    Fires on every denoising step so the user always sees activity.
+    Also starts a heartbeat thread that prints a dot every 30 s in case
+    the callback itself is not called (some pipeline versions skip it on
+    the last step).
+
+    Output format:
+      [gen] Step  5/50  (10%)  elapsed 0:02:31  ETA ~0:22:46  GPU0: 4.2GB free | GPU1: 6.1GB free
+    """
+    import threading, time as _time
+
+    state = {
+        "t_start":   _time.monotonic(),
+        "last_step": 0,
+        "done":      False,
+    }
+
+    # ── Heartbeat thread: one dot every 30 s while no step callback fires ─
+    heartbeat_interval = 30
+
+    def _heartbeat():
+        while not state["done"]:
+            _time.sleep(heartbeat_interval)
+            if state["done"]:
+                break
+            elapsed = _time.monotonic() - state["t_start"]
+            m, s    = divmod(int(elapsed), 60)
+            step    = state["last_step"]
+            if step == 0:
+                print(f"[gen] … still encoding prompt / setting up  "
+                      f"(elapsed {m}:{s:02d}){_vram_snapshot()}", flush=True)
+            else:
+                pct = step * 100 // total_steps
+                print(f"[gen] … step {step}/{total_steps} in progress  "
+                      f"(elapsed {m}:{s:02d}){_vram_snapshot()}", flush=True)
+
+    hb = threading.Thread(target=_heartbeat, daemon=True, name="Heartbeat")
+    hb.start()
+
+    def _stop_heartbeat():
+        state["done"] = True
+
+    def callback(_pipe: Any, step: int, _timestep: Any, callback_kwargs: dict) -> dict:
+        state["last_step"] = step + 1
+        elapsed  = _time.monotonic() - state["t_start"]
+        done_steps = step + 1
+        pct      = done_steps * 100 // total_steps
+
+        # ETA from average step time so far
+        avg_step = elapsed / done_steps
+        remaining = avg_step * (total_steps - done_steps)
+
+        def _fmt(secs: float) -> str:
+            m, s = divmod(int(secs), 60)
+            h, m = divmod(m, 60)
+            return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+        eta_str = f"ETA ~{_fmt(remaining)}" if done_steps < total_steps else "done"
+        vram    = _vram_snapshot()
+
+        prefix = f"[gen] {pass_label}" if pass_label else "[gen]"
+        print(
+            f"{prefix} Step {done_steps:>{len(str(total_steps))}}/{total_steps}"
+            f"  ({pct:3d}%)"
+            f"  elapsed {_fmt(elapsed)}"
+            f"  {eta_str}"
+            f"{vram}",
+            flush=True,
+        )
+
+        if done_steps >= total_steps:
+            _stop_heartbeat()
+
+        return callback_kwargs
+
+    # Attach stop_heartbeat so generate_video can call it after the pipe returns
+    callback._stop_heartbeat = _stop_heartbeat
+    return callback
+
+
 def _make_preview_hook(pipe: Any, every: int, out_dir: Path) -> Any:
-    """Build a `callback_on_step_end` that shows the clip forming step by step."""
+    """Legacy hook: decode and display a still image every N steps (--preview-every).
+    Wraps the progress callback so both fire together.
+    """
     state = {"failed": False}
 
     def hook(_pipe: Any, step: int, _timestep: Any, callback_kwargs: dict) -> dict:
@@ -402,7 +501,6 @@ def _make_preview_hook(pipe: Any, every: int, out_dir: Path) -> Any:
                 frame.save(path, quality=88)
                 _show_image(path, label=f"step {step + 1} ")
         except Exception as exc:
-            # Previews are cosmetic: never let them break a long run.
             state["failed"] = True
             print(f"[live] live previews disabled ({type(exc).__name__}: {exc})")
         return callback_kwargs
@@ -832,17 +930,49 @@ def generate_video(
         return output_path
 
     # ── Generate pass by pass; show each one as it lands ─────────────────
+    def _fmt_time(s: float) -> str:
+        m, s2 = divmod(int(s), 60)
+        h, m  = divmod(m, 60)
+        return f"{h}:{m:02d}:{s2:02d}" if h else f"{m}:{s2:02d}"
+
     pil_frames: list[Image.Image] = []
     for index, seg_target in enumerate(segment_sizes, start=1):
         seg_frames = cache.load_pass(index)          # None → must generate this one
 
         if seg_frames is None:
-            if len(segment_sizes) > 1:
-                print(f"\n[gen] ── Pass {index}/{len(segment_sizes)}: {seg_target} frames ──")
+            n_passes   = len(segment_sizes)
+            pass_label = f"Pass {index}/{n_passes}  " if n_passes > 1 else ""
+
+            if n_passes > 1:
+                print(f"\n[gen] ── Pass {index}/{n_passes}: {seg_target} frames ──")
                 if generator is not None:
-                    # A fixed seed would make every pass byte-identical; offset per
-                    # pass so the clip is reproducible yet actually moves.
                     generator.manual_seed(seed + index - 1)
+
+            # Fresh progress callback per pass (own timer + heartbeat thread)
+            progress_cb = _make_progress_callback(
+                total_steps=num_inference_steps,
+                total_frames=seg_target,
+                pass_label=pass_label,
+            )
+
+            # Combine with optional image preview hook
+            if preview_hook is not None:
+                _prev_h  = preview_hook
+                _prog_cb = progress_cb
+                def _combined(_pipe, step, _ts, kw,
+                               _p=_prev_h, _g=_prog_cb):
+                    kw = _p(_pipe, step, _ts, kw)
+                    return _g(_pipe, step, _ts, kw)
+                _combined._stop_heartbeat = progress_cb._stop_heartbeat
+                callback = _combined
+            else:
+                callback = progress_cb
+
+            # Banner printed before the denoising loop starts
+            start_label = (f"Pass {index}/{n_passes} s" if n_passes > 1 else "S")
+            print(f"[gen] {start_label}tarting denoising  "
+                  f"({num_inference_steps} steps, {seg_target} frames, "
+                  f"{width}×{height}){_vram_snapshot()}")
 
             t_pass = time.time()
             try:
@@ -860,17 +990,20 @@ def generate_video(
                     num_inference_steps=num_inference_steps,
                     guidance_scale=guidance_scale,
                     generator=generator,
-                    callback=preview_hook,
+                    callback=callback,
                     embeds=embeds,
                 )
             except BaseException as exc:            # includes Ctrl-C / Kaggle timeout
+                getattr(callback, "_stop_heartbeat", lambda: None)()
                 cache.report_interrupted(index, len(segment_sizes), exc)
                 raise
+            finally:
+                getattr(callback, "_stop_heartbeat", lambda: None)()
 
             elapsed     = time.time() - t_pass
             frames_used = output["frames_used"]
-            print(f"\n[gen] Pass {index} done in {elapsed:.1f}s  "
-                  f"({elapsed/frames_used:.2f}s/frame)")
+            print(f"\n[gen] Pass {index} done in {_fmt_time(elapsed)}  "
+                  f"({elapsed / frames_used:.1f}s/frame){_vram_snapshot()}")
 
             seg_frames = _extract_frames(output["result"])
             cache.save_pass(index, seg_frames)
