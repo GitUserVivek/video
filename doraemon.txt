@@ -1,0 +1,25 @@
+# doraemon.txt — Example screenplay for scene-by-scene video generation
+#
+# Usage:
+#   python main.py --screenplay doraemon.txt --model cogvideox-2b --steps 25 --guidance 7.0
+#
+# Format:
+#   [scene N, Xs]  Visual description of the scene
+#   [scene N, Xs, steps S]   Same with custom step count for this scene
+#
+# Tips:
+#   - Describe VISUALS, not dialogue. "Nobita running fast, school bag swinging,
+#     Japanese street, morning sunlight, anime style" works better than
+#     "Nobita was late for school".
+#   - Keep each scene short (3–5s) for best coherence.
+#   - Add style keywords to every scene for consistency:
+#     "anime style, colorful, Studio Ghibli inspired"
+
+[scene 1, 4s] Nobita running fast down a Japanese residential street, school uniform, bag swinging, morning golden light, anime style, colorful, Studio Ghibli inspired
+[scene 2, 3s] Nobita bursting through bedroom door shouting, Doraemon robot cat sitting on desk, surprised expression, cozy Japanese room, anime style, colorful
+[scene 3, 4s] Doraemon smiling and pulling a glowing pink magical door from his belly pouch, sparkles and light effects, anime style, vibrant colors
+[scene 4, 3s] Nobita stepping through the magical door portal, bright light tunnel, amazed expression, anime style
+[scene 5, 4s] Nobita suddenly standing on a beautiful tropical beach, turquoise ocean, white sand, shocked surprised expression, anime style, colorful bright
+[scene 6, 3s] Doraemon laughing and pulling out a tiny silver time machine device from belly pouch, animated cartoon, cheerful, colorful
+[scene 7, 4s] Nobita and Doraemon arriving at school gate just as school bell rings, cherry blossom trees, other students entering, anime style, warm morning light
+[scene 8, 3s] Nobita smiling relieved and grateful, looking at Doraemon with big happy eyes, school entrance, anime style, heartwarming, colorful

@@ -118,6 +118,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--summary",      action="store_true",
                    help="Print hardware summary and exit.")
 
+    # ── Screenplay / scene-by-scene flags ──────────────────────────────────
+    p.add_argument("--screenplay",   default=None, metavar="FILE",
+                   help="Path to a scene script file. Each line describes one "
+                        "scene; clips are generated sequentially then stitched "
+                        "into one final video. See examples/doraemon.txt.")
+    p.add_argument("--scene-output-dir", default=None, dest="scene_output_dir",
+                   help="Directory for per-scene clip files "
+                        "(default: <output_stem>_scenes/).")
+    p.add_argument("--fade-frames",  type=int, default=4, dest="fade_frames",
+                   help="Cross-dissolve length in frames between scenes (default: 4).")
+
     # ── Persistent server flags ────────────────────────────────────────────
     p.add_argument("--release-resources", action="store_true",
                    dest="release_resources",
@@ -177,6 +188,106 @@ def _apply_fast_preset(args) -> bool:
         if stream is None:          stream = FAST_PRESET["stream"]
 
     return bool(stream)
+
+
+def _run_screenplay(args, hw_cfg: dict) -> int:
+    """Generate a scene-by-scene video from a screenplay file.
+
+    Each scene is generated as an independent clip (with its own cache entry),
+    then all clips are cross-dissolved into one final video.  A failed scene
+    can be re-run without regenerating the others — the cache handles it.
+    """
+    from screenplay import parse_screenplay, print_screenplay
+    from stitcher import stitch_scenes
+    from generator import generate_scene
+    from model import load_pipeline, select_model
+
+    # ── Parse screenplay ───────────────────────────────────────────────────
+    try:
+        scenes = parse_screenplay(args.screenplay)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    print_screenplay(scenes)
+
+    # ── Resolve output paths ───────────────────────────────────────────────
+    if args.output:
+        final_path = Path(args.output)
+    else:
+        stem = Path(args.screenplay).stem
+        final_path = Path(f"output_{stem}_{int(time.time())}.mp4")
+
+    scene_dir = Path(args.scene_output_dir) if args.scene_output_dir \
+                else final_path.parent / f"{final_path.stem}_scenes"
+    scene_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Load model once for all scenes ────────────────────────────────────
+    model_id = args.model or select_model(hw_cfg)
+    print(f"[screenplay] Loading model: {model_id} …\n")
+    t_load = time.time()
+    pipe, model_info = load_pipeline(model_id, hw_cfg)
+    print(f"[screenplay] Model ready in {time.time() - t_load:.1f}s\n")
+
+    # ── Resolve shared generation params ──────────────────────────────────
+    fps      = args.fps or 8
+    seed     = args.seed
+    steps    = args.num_steps
+    guidance = args.guidance
+    res      = args.resolution or hw_cfg.get("max_resolution", "720")
+
+    # ── Generate each scene ────────────────────────────────────────────────
+    clip_paths: list[Path] = []
+    failed: list[int]      = []
+
+    for scene in scenes:
+        try:
+            clip = generate_scene(
+                scene            = scene,
+                pipe             = pipe,
+                model_info       = model_info,
+                hw_cfg           = hw_cfg,
+                output_dir       = scene_dir,
+                default_steps    = steps,
+                default_guidance = guidance,
+                default_resolution = res,
+                fps              = fps,
+                seed             = seed,
+                cache_dir        = args.cache_dir,
+                resume           = not args.no_resume,
+                preview_every    = args.preview_every,
+            )
+            clip_paths.append(clip)
+            print(f"[screenplay] ✓ Scene {scene.index} → {clip.name}\n")
+        except Exception as exc:
+            print(f"\n[screenplay] ✗ Scene {scene.index} FAILED: {exc}")
+            print(f"[screenplay]   Re-run the same command to retry — "
+                  f"completed scenes are cached.\n")
+            failed.append(scene.index)
+
+    if not clip_paths:
+        print("[screenplay] No scenes completed — nothing to stitch.")
+        return 1
+
+    if failed:
+        print(f"[screenplay] Warning: {len(failed)} scene(s) failed "
+              f"(scenes {failed}). Stitching available clips only.\n")
+
+    # ── Stitch ─────────────────────────────────────────────────────────────
+    try:
+        final = stitch_scenes(
+            clips       = clip_paths,
+            output_path = final_path,
+            fps         = fps,
+            fade_frames = args.fade_frames,
+        )
+        print(f"\n✓ Done!  Final video ({len(clip_paths)} scenes) → {final.resolve()}\n")
+        if failed:
+            print(f"  Re-run to fill in missing scenes: {failed}\n")
+        return 0
+    except Exception as exc:
+        print(f"[screenplay] Stitch failed: {exc}")
+        return 1
 
 
 def main() -> int:
@@ -273,6 +384,10 @@ def main() -> int:
     if args.clear_cache:
         from cache import clear_cache
         clear_cache(args.cache_dir)
+
+    # ── Screenplay mode ────────────────────────────────────────────────────
+    if args.screenplay:
+        return _run_screenplay(args, hw_cfg)
 
     # ── Build prompt from positional arg and/or script file ───────────────
     if args.script:

@@ -1317,3 +1317,61 @@ def _write_mp4_opencv(frames: list[Image.Image], path: Path, fps: int) -> None:
         writer.write(bgr)
     writer.release()
     print(f"[gen] Written via OpenCV ({len(frames)} frames, {fps} fps)")
+
+
+# ── Scene-by-scene generation ─────────────────────────────────────────────────
+
+def generate_scene(
+    scene: "Any",               # screenplay.Scene
+    pipe: "Any",
+    model_info: dict,
+    hw_cfg: dict,
+    output_dir: "Path",
+    default_steps: int | None        = None,
+    default_guidance: float | None   = None,
+    default_resolution: str | None   = None,
+    fps: int | None                  = None,
+    seed: int | None                 = None,
+    cache_dir: "str | Path | None"   = None,
+    resume: bool                     = True,
+    preview_every: int               = 0,
+) -> "Path":
+    """Generate a single scene clip and return its output path.
+
+    Wraps generate_video() with scene-specific overrides (duration, steps,
+    guidance) from the Scene object, falling back to the CLI defaults.
+
+    Parameters
+    ----------
+    scene           : screenplay.Scene instance
+    output_dir      : directory where scene clips are written
+    default_steps   : steps to use when scene.steps is None
+    default_guidance: guidance to use when scene.guidance is None
+    """
+    clip_path = Path(output_dir) / f"scene_{scene.index:03d}.mp4"
+
+    steps    = scene.steps    if scene.steps    is not None else default_steps
+    guidance = scene.guidance if scene.guidance is not None else default_guidance
+
+    print(f"\n{'═'*60}")
+    print(f"[screenplay] Scene {scene.index}  "
+          f"({scene.duration:.0f}s, {steps or 'auto'} steps)  "
+          f"{scene.prompt[:60]}{'…' if len(scene.prompt) > 60 else ''}")
+    print(f"{'═'*60}")
+
+    return generate_video(
+        pipe                = pipe,
+        model_info          = model_info,
+        hw_cfg              = hw_cfg,
+        prompt              = scene.prompt,
+        duration_sec        = scene.duration,
+        fps                 = fps,
+        resolution          = default_resolution,
+        seed                = seed,
+        num_inference_steps = steps,
+        guidance_scale      = guidance,
+        output_path         = str(clip_path),
+        preview_every       = preview_every,
+        cache_dir           = cache_dir,
+        resume              = resume,
+    )
