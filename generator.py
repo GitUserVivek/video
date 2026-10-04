@@ -844,6 +844,18 @@ def _run_pipeline(pipe, model_id, enhanced_prompt, negative, total_frames,
     if callback is not None:
         kwargs["callback_on_step_end"] = callback
 
+    # Inspect the pipeline's __call__ signature once so we never pass kwargs it
+    # doesn't accept.  This is the root cause of the CogVideoX crash: the mask
+    # kwargs are LTX-only and CogVideoXPipeline.__call__() rejects them.
+    import inspect as _inspect
+    try:
+        _pipe_params = set(_inspect.signature(pipe.__call__).parameters)
+    except Exception:
+        _pipe_params = None   # unknown — we'll fall back to trial/error
+
+    def _pipe_accepts(key: str) -> bool:
+        return _pipe_params is None or key in _pipe_params
+
     using_embeds = bool(embeds and embeds.get("positive") is not None)
     if using_embeds:
         kwargs["prompt_embeds"] = embeds["positive"]
@@ -852,21 +864,22 @@ def _run_pipeline(pipe, model_id, enhanced_prompt, negative, total_frames,
         # Pipeline rejects having both prompt text and prompt_embeds at once
         kwargs.pop("prompt", None)
         kwargs.pop("negative_prompt", None)
-        # LTXPipeline requires explicit attention masks alongside cached embeddings
-        # (it cannot re-derive them from the dropped text), and it also requires
-        # prompt_embeds.shape == negative_prompt_embeds.shape when both are present.
+        # Attention masks are LTX-specific — only forward them when the pipeline
+        # actually declares those parameters (avoids the CogVideoX TypeError).
         if isinstance(embeds, dict):
-            if embeds.get("prompt_attention_mask") is not None:
+            if (embeds.get("prompt_attention_mask") is not None
+                    and _pipe_accepts("prompt_attention_mask")):
                 kwargs["prompt_attention_mask"] = embeds["prompt_attention_mask"]
-            if embeds.get("negative") is not None and embeds.get("negative_prompt_attention_mask") is not None:
+            if (embeds.get("negative") is not None
+                    and embeds.get("negative_prompt_attention_mask") is not None
+                    and _pipe_accepts("negative_prompt_attention_mask")):
                 kwargs["negative_prompt_attention_mask"] = embeds["negative_prompt_attention_mask"]
-            elif embeds.get("negative") is not None and "negative_prompt_attention_mask" not in kwargs:
-                # Fallback mask for non-LTX pipelines that still want a mask present.
-                kwargs["negative_prompt_attention_mask"] = torch.ones(
-                    1,
-                    dtype=torch.long,
-                    device=_neg_mask_device(kwargs, pipe),
-                )
+
+    # Keys that are embedding-related and must all be stripped on fallback
+    _EMBED_KEYS = (
+        "prompt_embeds", "negative_prompt_embeds",
+        "prompt_attention_mask", "negative_prompt_attention_mask",
+    )
 
     with torch.inference_mode():
         try:
@@ -881,8 +894,13 @@ def _run_pipeline(pipe, model_id, enhanced_prompt, negative, total_frames,
                   f"({type(exc).__name__}) — falling back to the pipeline's encoding")
             if embeds is not None:
                 embeds.clear()
-            kwargs.pop("prompt_embeds", None)
-            kwargs.pop("negative_prompt_embeds", None)
+            for _k in _EMBED_KEYS:
+                kwargs.pop(_k, None)
+            # Restore the text prompt so the pipeline can encode it itself
+            if "prompt" not in kwargs:
+                kwargs["prompt"] = enhanced_prompt
+            if "negative_prompt" not in kwargs:
+                kwargs["negative_prompt"] = negative
             return pipe(**kwargs)
 
 
