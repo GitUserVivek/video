@@ -291,6 +291,22 @@ _REQUIRED_FILES: dict[str, list[str]] = {
     ],
 }
 
+def _snapshot_dir(repo_id: str) -> Path:
+    """Standard HF snapshot directory for a repo."""
+    safe_name = repo_id.replace("/", "--")
+    return HF_CACHE / "hub" / f"models--{safe_name}"
+
+
+def _required_files_present(snapshot_dir: Path, required: list[str]) -> bool:
+    """Check that every required file exists somewhere under the snapshot dir."""
+    have: set[Path] = set()
+    for p in snapshot_dir.rglob("*"):
+        if p.is_file():
+            have.add(p.name)
+    missing = [f for f in required if f not in have]
+    return not missing
+
+
 def ensure_model_downloaded(repo_id: str, model_id: str | None = None) -> Path:
     """Download only the exact files needed for inference.
 
@@ -299,35 +315,32 @@ def ensure_model_downloaded(repo_id: str, model_id: str | None = None) -> Path:
 
     For all other repos: falls back to snapshot_download() with ignore_patterns.
     """
-    safe_name    = repo_id.replace("/", "--")
-    snapshot_dir = HF_CACHE / "hub" / f"models--{safe_name}"
+    snapshot_dir = _snapshot_dir(repo_id)
 
     # For the distilled variant, delegate to the base repo but request extra files
     if model_id == "ltx-video-distilled":
         distilled_file = MODELS["ltx-video-distilled"]["distilled_weights"]
         required = _REQUIRED_FILES.get("Lightricks/LTX-Video/distilled", [])
-        # Check if distilled weight is already cached
-        if snapshot_dir.exists():
-            hits = list(snapshot_dir.glob(f"**/{distilled_file}"))
-            if hits:
-                print(f"[model] Cache hit: {repo_id} (distilled)")
-                return snapshot_dir
+        # Verify the actual required files (including the distilled weight) are present
+        if snapshot_dir.exists() and _required_files_present(snapshot_dir, required):
+            print(f"[model] Cache hit: {repo_id} (distilled)")
+            return snapshot_dir
         size_hint = _SIZE_HINTS.get(repo_id, "~6 GB  (distilled transformer only)")
         print(f"[model] Downloading {repo_id}  {size_hint}")
         return _download_exact_files(repo_id, required)
 
-    # Cache hit check
-    if snapshot_dir.exists():
-        weights = (list(snapshot_dir.glob("**/*.safetensors")) +
-                   list(snapshot_dir.glob("**/*.bin")))
-        if weights:
+    # Cache hit check — verify the *required* files are actually present,
+    # not just that the directory exists or contains any weights at all.
+    required = _REQUIRED_FILES.get(repo_id)
+    if required is not None and snapshot_dir.exists():
+        if _required_files_present(snapshot_dir, required):
             print(f"[model] Cache hit: {repo_id}")
             return snapshot_dir
+        print(f"[model] Partial cache found for {repo_id} — re-downloading missing files")
 
     size_hint = _SIZE_HINTS.get(repo_id, "")
     print(f"[model] Downloading {repo_id}  {size_hint}")
 
-    required = _REQUIRED_FILES.get(repo_id)
     if required:
         return _download_exact_files(repo_id, required)
     else:
@@ -335,19 +348,35 @@ def ensure_model_downloaded(repo_id: str, model_id: str | None = None) -> Path:
 
 
 def _download_exact_files(repo_id: str, files: list[str]) -> Path:
-    """Download only explicitly requested files from Hugging Face."""
+    """Download only explicitly requested files from Hugging Face.
 
-    from huggingface_hub import hf_hub_download
+    Each file is fetched with hf_hub_download() into the HF blob cache, then
+    materialized under the snapshot directory so subsequent runs see a complete
+    snapshot and `snapshot_download(local_files_only=True)` resolves cleanly.
+    """
+
+    from huggingface_hub import hf_hub_download, snapshot_download
 
     print(
         f"[model] Fetching {len(files)} file(s) "
         f"(exact list — skips all other weights)"
     )
 
+    snapshot_dir = _snapshot_dir(repo_id)
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
     downloaded = 0
     failed = []
 
     for filename in files:
+        dest = snapshot_dir / filename
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        if dest.exists() and dest.stat().st_size > 0:
+            print(f"[model]   skip  {filename} (already present)")
+            downloaded += 1
+            continue
+
         try:
             path = hf_hub_download(
                 repo_id=repo_id,
@@ -358,13 +387,13 @@ def _download_exact_files(repo_id: str, files: list[str]) -> Path:
                 resume_download=True,
             )
 
-            size_mb = Path(path).stat().st_size / 1e6
+            # Materialize into the snapshot tree if not already there
+            if not dest.exists() or dest.stat().st_size == 0:
+                import shutil
+                shutil.copy2(path, dest)
 
-            print(
-                f"[model]   ✓  {filename}  "
-                f"({size_mb:.0f} MB)"
-            )
-
+            size_mb = dest.stat().st_size / 1e6
+            print(f"[model]   ✓  {filename}  ({size_mb:.0f} MB)")
             downloaded += 1
 
         except Exception as exc:
@@ -385,18 +414,20 @@ def _download_exact_files(repo_id: str, files: list[str]) -> Path:
         f"to HF cache"
     )
 
-    # Return the actual HF snapshot directory.
-    from huggingface_hub import snapshot_download
-
-    snapshot_path = snapshot_download(
-        repo_id=repo_id,
-        cache_dir=str(HF_CACHE / "hub"),
-        local_files_only=True,
-        token=HF_TOKEN or None,
-        etag_timeout=30,
-    )
-
-    return Path(snapshot_path)
+    # Resolve the snapshot directory. If hf_hub_download placed files in the
+    # blob cache rather than the snapshot tree, snapshot_download(local_files_only)
+    # may still fail — fall back to the directory we just populated.
+    try:
+        snapshot_path = snapshot_download(
+            repo_id=repo_id,
+            cache_dir=str(HF_CACHE / "hub"),
+            local_files_only=True,
+            token=HF_TOKEN or None,
+            etag_timeout=30,
+        )
+        return Path(snapshot_path)
+    except Exception:
+        return snapshot_dir
 
 def _download_exact_files_old(repo_id: str, files: list[str]) -> Path:
     """Download a specific list of files from a HuggingFace repo."""

@@ -73,6 +73,16 @@ from PIL import Image
 from cache import RunCache, RunSignature, default_cache_root
 
 
+_LTX_ENCODE_RETURNS = 4   # (prompt_embeds, prompt_attention_mask,
+                          #  negative_prompt_embeds, negative_prompt_attention_mask)
+_LTX_STORE_KEYS = (
+    "positive",
+    "positive_mask",
+    "negative",
+    "negative_mask",
+)
+
+
 # ── Resolution presets ────────────────────────────────────────────────────────
 # All dimensions must be divisible by 32 (LTX-Video hard requirement; also
 # satisfies CogVideoX's divisible-by-8 requirement).
@@ -457,6 +467,29 @@ def _place_embeds(pipe: Any, positive: Any, negative: Any) -> dict:
     return {"positive": positive, "negative": negative}
 
 
+def _neg_mask_device(kwargs: dict, pipe: Any) -> torch.device:
+    """Pick a device for a fallback negative-prompt attention mask."""
+    if "prompt_attention_mask" in kwargs and kwargs["prompt_attention_mask"] is not None:
+        return kwargs["prompt_attention_mask"].device
+    gen = kwargs.get("generator")
+    if gen is not None and hasattr(gen, "device"):
+        return gen.device
+    exec_dev = getattr(pipe, "_execution_device", None)
+    if exec_dev is not None:
+        return exec_dev
+    return torch.device("cpu")
+
+
+def _is_ltx_pipeline(pipe: Any) -> bool:
+    """LTXPipeline.encode_prompt returns (pos, pos_mask, neg, neg_mask),
+    not the 2-tuple the rest of this module was written for."""
+    name = getattr(pipe, "__class__", None)
+    if name is None:
+        return False
+    qual = getattr(name, "__name__", "")
+    return "LTXPipeline" in qual or "LTX" in qual
+
+
 def _prepare_embeds(
     pipe: Any,
     cache: RunCache,
@@ -470,19 +503,41 @@ def _prepare_embeds(
     forward per pass — noticeable on the fast path, where a whole clip is only a few
     passes. Returns a mutable dict (so a rejected batch can be cleared for the rest of
     the run) or None to let the pipeline encode as usual.
+
+    LTXPipeline.encode_prompt returns a 4-tuple:
+        (prompt_embeds, prompt_attention_mask,
+         negative_prompt_embeds, negative_prompt_attention_mask)
+    so we store and replay that full tuple rather than collapsing it to a 2-tuple.
     """
     cached = cache.load_embeds()
     if cached is not None:
-        positive, negative_embeds = cached
-        if negative_embeds is None and guidance_scale > 1.0:
-            print("[cache] Cached embeddings lack the negative half CFG needs "
-                  "— re-encoding")
+        # cached may be a 2-tuple (older/common pipelines) or a 4-tuple (LTX)
+        if len(cached) == 4:
+            pos, pos_mask, neg, neg_mask = cached
+            if neg is None and guidance_scale > 1.0:
+                print("[cache] Cached embeddings lack the negative half CFG needs "
+                      "— re-encoding")
+            else:
+                placed = _place_embeds(pipe, pos, neg)
+                # LTX needs the masks forwarded as well
+                if getattr(placed, "get", None) is not None:
+                    placed["prompt_attention_mask"] = pos_mask
+                    if neg is not None:
+                        placed["negative_prompt_attention_mask"] = neg_mask
+                return placed
         else:
-            return _place_embeds(pipe, positive, negative_embeds)
+            positive, negative_embeds = cached[0], cached[1]
+            if negative_embeds is None and guidance_scale > 1.0:
+                print("[cache] Cached embeddings lack the negative half CFG needs "
+                      "— re-encoding")
+            else:
+                return _place_embeds(pipe, positive, negative_embeds)
 
     encoder = getattr(pipe, "encode_prompt", None)
     if not callable(encoder):
         return None
+
+    is_ltx = _is_ltx_pipeline(pipe)
 
     try:
         import inspect
@@ -494,6 +549,8 @@ def _prepare_embeds(
             kwargs["num_videos_per_prompt"] = 1
         if "device" in params:
             kwargs["device"] = getattr(pipe, "_execution_device", None) or pipe.device
+        if "max_sequence_length" in params:
+            kwargs["max_sequence_length"] = 128
 
         with torch.inference_mode():
             result = encoder(prompt=prompt, negative_prompt=negative, **kwargs)
@@ -504,6 +561,19 @@ def _prepare_embeds(
 
     if not isinstance(result, (tuple, list)) or len(result) < 2:
         return None
+
+    if is_ltx and len(result) == 4:
+        # LTX returns (pos, pos_mask, neg, neg_mask)
+        positive, pos_mask, negative_embeds, neg_mask = result
+        if positive is None or (negative_embeds is None and guidance_scale > 1.0):
+            return None
+        cache.save_embeds(positive, negative_embeds, pos_mask=pos_mask, neg_mask=neg_mask)
+        placed = _place_embeds(pipe, positive, negative_embeds)
+        placed["prompt_attention_mask"] = pos_mask
+        if negative_embeds is not None:
+            placed["negative_prompt_attention_mask"] = neg_mask
+        return placed
+
     positive, negative_embeds = result[0], result[1]
     if positive is None or (negative_embeds is None and guidance_scale > 1.0):
         return None
@@ -781,20 +851,21 @@ def _run_pipeline(pipe, model_id, enhanced_prompt, negative, total_frames,
         # Pipeline rejects having both prompt text and prompt_embeds at once
         kwargs.pop("prompt", None)
         kwargs.pop("negative_prompt", None)
-        # LTXPipeline requires an explicit prompt_attention_mask alongside the
-        # cached prompt_embeds (it cannot re-derive it from the dropped text).
-        if "prompt_attention_mask" not in kwargs:
-            kwargs["prompt_attention_mask"] = torch.ones(
-                1, dtype=torch.long,
-                device=(kwargs["generator"].device
-                        if hasattr(kwargs.get("generator"), "device")
-                        else getattr(pipe, "_execution_device", None)
-                        or torch.device("cpu")),
-            )
-        if "negative_prompt_attention_mask" not in kwargs and embeds.get("negative") is not None:
-            kwargs["negative_prompt_attention_mask"] = torch.ones(
-                1, dtype=torch.long, device=kwargs["prompt_attention_mask"].device,
-            )
+        # LTXPipeline requires explicit attention masks alongside cached embeddings
+        # (it cannot re-derive them from the dropped text), and it also requires
+        # prompt_embeds.shape == negative_prompt_embeds.shape when both are present.
+        if isinstance(embeds, dict):
+            if embeds.get("prompt_attention_mask") is not None:
+                kwargs["prompt_attention_mask"] = embeds["prompt_attention_mask"]
+            if embeds.get("negative") is not None and embeds.get("negative_prompt_attention_mask") is not None:
+                kwargs["negative_prompt_attention_mask"] = embeds["negative_prompt_attention_mask"]
+            elif embeds.get("negative") is not None and "negative_prompt_attention_mask" not in kwargs:
+                # Fallback mask for non-LTX pipelines that still want a mask present.
+                kwargs["negative_prompt_attention_mask"] = torch.ones(
+                    1,
+                    dtype=torch.long,
+                    device=_neg_mask_device(kwargs, pipe),
+                )
 
     with torch.inference_mode():
         try:

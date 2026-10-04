@@ -203,8 +203,14 @@ class RunCache:
 
     # ── prompt embeddings ─────────────────────────────────────────────────
 
-    def load_embeds(self) -> tuple["torch.Tensor", "torch.Tensor | None"] | None:
-        """Return cached (positive, negative) text embeddings if they are usable."""
+    def load_embeds(self) -> tuple | None:
+        """Return cached text embeddings if they are usable.
+
+        Returns either:
+          * a 2-tuple (positive, negative_or_None) for most pipelines, or
+          * a 4-tuple (positive, positive_mask, negative_or_None, negative_mask)
+            for pipelines like LTXPipeline that also require the attention masks.
+        """
         if not self.enabled:
             return None
         path = self.dir / "prompt_embeds.npz"
@@ -217,15 +223,38 @@ class RunCache:
                 negative = None
                 if "negative" in data.files:
                     negative = _to_tensor(torch, data["negative"], str(data["negative_dtype"]))
+                pos_mask = None
+                if "positive_mask" in data.files:
+                    pos_mask = _to_tensor(
+                        torch, data["positive_mask"], str(data["positive_mask_dtype"])
+                    )
+                neg_mask = None
+                if "negative_mask" in data.files:
+                    neg_mask = _to_tensor(
+                        torch, data["negative_mask"], str(data["negative_mask_dtype"])
+                    )
+            if pos_mask is not None or neg_mask is not None:
+                print("[cache] Reusing cached prompt embeddings + masks (text encoder skipped)")
+                return (positive, pos_mask, negative, neg_mask)
             print("[cache] Reusing cached prompt embeddings (text encoder skipped)")
-            return positive, negative
+            return (positive, negative)
         except Exception as exc:                               # noqa: BLE001
             print(f"[cache] Cached embeddings unusable ({type(exc).__name__}: {exc})")
             self._discard(path)
             return None
 
-    def save_embeds(self, positive: "torch.Tensor", negative: "torch.Tensor | None") -> None:
-        """Store raw T5 output so a resumed run can skip text encoding entirely."""
+    def save_embeds(
+        self,
+        positive: "torch.Tensor",
+        negative: "torch.Tensor | None",
+        pos_mask: "torch.Tensor | None" = None,
+        neg_mask: "torch.Tensor | None" = None,
+    ) -> None:
+        """Store raw T5 output so a resumed run can skip text encoding entirely.
+
+        For pipelines like LTXPipeline that also require the attention masks to be
+        forwarded alongside the cached embeddings, those masks are stored as well.
+        """
         if not self.enabled or positive is None:
             return
         try:
@@ -238,6 +267,12 @@ class RunCache:
             if negative is not None:
                 payload["negative"]       = negative.detach().float().cpu().numpy()
                 payload["negative_dtype"] = str(negative.dtype)
+            if pos_mask is not None:
+                payload["positive_mask"]       = pos_mask.detach().cpu().numpy()
+                payload["positive_mask_dtype"] = str(pos_mask.dtype)
+            if neg_mask is not None:
+                payload["negative_mask"]       = neg_mask.detach().cpu().numpy()
+                payload["negative_mask_dtype"] = str(neg_mask.dtype)
             np.savez(self.dir / "prompt_embeds.npz", **payload)
             print("[cache] Prompt embeddings cached")
         except Exception as exc:                               # noqa: BLE001
