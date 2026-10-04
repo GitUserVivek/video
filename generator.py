@@ -468,10 +468,29 @@ def _is_cuda_oom(exc: BaseException) -> bool:
 
 
 def _place_embeds(pipe: Any, positive: Any, negative: Any) -> dict:
-    """Return embeddings on the dtype/device the transformer will be called with."""
+    """Move embeddings to the transformer's device and dtype.
+
+    With device_map="balanced" the text encoder may be on cuda:1 and the
+    transformer on cuda:0. Embeddings produced by encode_prompt live on the
+    text encoder's device and must be explicitly moved to the transformer's
+    device before being passed to __call__, otherwise the pipeline internally
+    moves them but can deadlock on a cross-device CUDA sync.
+    """
     try:
-        dtype  = getattr(getattr(pipe, "transformer", None), "dtype", None)
-        device = getattr(pipe, "_execution_device", None)
+        transformer = getattr(pipe, "transformer", None)
+        dtype  = getattr(transformer, "dtype", None) if transformer else None
+        # Prefer the transformer's own device over pipe._execution_device
+        device = None
+        if transformer is not None:
+            try:
+                p = next(iter(transformer.parameters()), None)
+                if p is not None:
+                    device = p.device
+            except Exception:
+                pass
+        if device is None:
+            device = getattr(pipe, "_execution_device", None)
+
         if dtype is not None:
             positive = positive.to(dtype=dtype)
             negative = None if negative is None else negative.to(dtype=dtype)
@@ -506,6 +525,27 @@ def _is_ltx_pipeline(pipe: Any) -> bool:
     return "LTXPipeline" in qual or "LTX" in qual
 
 
+def _text_encoder_device(pipe: Any) -> "torch.device | None":
+    """Find the actual device the text encoder's first parameter lives on.
+
+    With device_map="balanced" the text encoder may be on a different CUDA
+    device than pipe._execution_device (which points at the transformer).
+    Passing the wrong device to encode_prompt causes a cross-device CUDA
+    sync that hangs indefinitely on some diffusers/accelerate versions.
+    """
+    try:
+        te = getattr(pipe, "text_encoder", None)
+        if te is None:
+            return None
+        # accelerate wraps parameters; get the first one's device
+        p = next(iter(te.parameters()), None)
+        if p is not None:
+            return p.device
+    except Exception:
+        pass
+    return None
+
+
 def _prepare_embeds(
     pipe: Any,
     cache: RunCache,
@@ -516,18 +556,19 @@ def _prepare_embeds(
     """Encode the prompt once (or load it from cache) for every pass to reuse.
 
     Text encoding is identical for every pass of a run, so doing it once saves a T5
-    forward per pass — noticeable on the fast path, where a whole clip is only a few
-    passes. Returns a mutable dict (so a rejected batch can be cleared for the rest of
-    the run) or None to let the pipeline encode as usual.
+    forward per pass. Returns a mutable dict or None to let the pipeline encode as usual.
 
-    LTXPipeline.encode_prompt returns a 4-tuple:
-        (prompt_embeds, prompt_attention_mask,
-         negative_prompt_embeds, negative_prompt_attention_mask)
-    so we store and replay that full tuple rather than collapsing it to a 2-tuple.
+    Device note (device_map="balanced"):
+        pipe._execution_device → transformer device (e.g. cuda:0)
+        text encoder            → may be on cuda:1
+
+    We always resolve the text encoder's *actual* device and pass it explicitly
+    to encode_prompt. Passing the wrong device causes an indefinite hang in
+    diffusers ≥ 0.30 + accelerate when the CUDA stream never synchronises.
     """
     cached = cache.load_embeds()
     if cached is not None:
-        # cached may be a 2-tuple (older/common pipelines) or a 4-tuple (LTX)
+        # cached may be a 2-tuple (CogVideoX) or a 4-tuple (LTX)
         if len(cached) == 4:
             pos, pos_mask, neg, neg_mask = cached
             if neg is None and guidance_scale > 1.0:
@@ -535,7 +576,6 @@ def _prepare_embeds(
                       "— re-encoding")
             else:
                 placed = _place_embeds(pipe, pos, neg)
-                # LTX needs the masks forwarded as well
                 if getattr(placed, "get", None) is not None:
                     placed["prompt_attention_mask"] = pos_mask
                     if neg is not None:
@@ -555,6 +595,15 @@ def _prepare_embeds(
 
     is_ltx = _is_ltx_pipeline(pipe)
 
+    # Resolve the text encoder's actual device — critical under device_map.
+    te_device = _text_encoder_device(pipe)
+    exec_device = getattr(pipe, "_execution_device", None)
+    encode_device = te_device or exec_device
+
+    if te_device and exec_device and str(te_device) != str(exec_device):
+        print(f"[gen] Text encoder on {te_device}, transformer on {exec_device} "
+              f"— encoding on {te_device} (device_map split)")
+
     try:
         import inspect
         params = inspect.signature(encoder).parameters
@@ -564,7 +613,7 @@ def _prepare_embeds(
         if "num_videos_per_prompt" in params:
             kwargs["num_videos_per_prompt"] = 1
         if "device" in params:
-            kwargs["device"] = getattr(pipe, "_execution_device", None) or pipe.device
+            kwargs["device"] = encode_device
         if "max_sequence_length" in params:
             kwargs["max_sequence_length"] = 128
 
@@ -659,11 +708,15 @@ def generate_video(
     if resolution not in RESOLUTIONS:
         raise ValueError(f"resolution must be one of {list(RESOLUTIONS.keys())}")
 
+    # Hard-clamp to hardware capability. Prompt hints like "4K" or "1080p" must
+    # not exceed what the GPU can actually handle — going above max_resolution
+    # causes OOM in the activation tensors, not just slowness.
     capability = hw_cfg.get("max_resolution")
     if capability and _RES_ORDER.index(resolution) > _RES_ORDER.index(capability):
-        print(f"[gen] Note: {resolution}p is above the detected capability "
-              f"({capability}p) — this will be slow on "
-              f"{hw_cfg.get('vram_gb', 0):.0f} GB per GPU")
+        print(f"[gen] Resolution clamped {resolution}p → {capability}p "
+              f"(hardware cap for {hw_cfg.get('vram_gb', 0):.0f} GB/GPU; "
+              f"use --resolution {resolution} to override at your own risk)")
+        resolution = capability
 
     # ── Duration: CLI flag > prompt hint > default (10 s) ────────────────
     if duration_sec is None:
@@ -907,12 +960,48 @@ def _run_pipeline(pipe, model_id, enhanced_prompt, negative, total_frames,
             if not using_embeds or _is_cuda_oom(exc):
                 raise
             print(f"[gen] Cached prompt embeddings rejected "
-                  f"({type(exc).__name__}) — falling back to the pipeline's encoding")
+                  f"({type(exc).__name__}) — re-encoding on correct device")
             if embeds is not None:
                 embeds.clear()
             for _k in _EMBED_KEYS:
                 kwargs.pop(_k, None)
-            # Restore the text prompt so the pipeline can encode it itself
+
+            # Re-encode directly on the text encoder's device to avoid the
+            # cross-device hang that occurs when the pipeline's internal
+            # encode_prompt uses _execution_device (transformer) instead of
+            # the actual text encoder device (may differ under device_map).
+            te_device = _text_encoder_device(pipe)
+            encoder   = getattr(pipe, "encode_prompt", None)
+            if callable(encoder) and te_device is not None:
+                try:
+                    import inspect as _ins
+                    enc_params = _ins.signature(encoder).parameters
+                    enc_kwargs: dict = {}
+                    if "do_classifier_free_guidance" in enc_params:
+                        enc_kwargs["do_classifier_free_guidance"] = guidance_scale > 1.0
+                    if "num_videos_per_prompt" in enc_params:
+                        enc_kwargs["num_videos_per_prompt"] = 1
+                    if "device" in enc_params:
+                        enc_kwargs["device"] = te_device
+                    if "max_sequence_length" in enc_params:
+                        enc_kwargs["max_sequence_length"] = 128
+
+                    enc_result = encoder(
+                        prompt=enhanced_prompt,
+                        negative_prompt=negative,
+                        **enc_kwargs,
+                    )
+                    if isinstance(enc_result, (tuple, list)) and len(enc_result) >= 2:
+                        new_embeds = _place_embeds(pipe, enc_result[0], enc_result[1])
+                        kwargs["prompt_embeds"]          = new_embeds["positive"]
+                        kwargs["negative_prompt_embeds"] = new_embeds["negative"]
+                        # Do NOT restore text prompt — embeds replace it
+                        print("[gen] Re-encoded successfully — proceeding with embeddings")
+                        return pipe(**kwargs)
+                except Exception as enc_exc:
+                    print(f"[gen] Re-encode failed ({enc_exc}) — trying raw text call")
+
+            # Last resort: restore text and let the pipeline handle encoding
             if "prompt" not in kwargs:
                 kwargs["prompt"] = enhanced_prompt
             if "negative_prompt" not in kwargs:
