@@ -210,6 +210,9 @@ class RunCache:
           * a 2-tuple (positive, negative_or_None) for most pipelines, or
           * a 4-tuple (positive, positive_mask, negative_or_None, negative_mask)
             for pipelines like LTXPipeline that also require the attention masks.
+
+        Any shape inconsistency, dtype error, or missing array causes the cache
+        entry to be discarded so the next call re-encodes from scratch.
         """
         if not self.enabled:
             return None
@@ -233,13 +236,22 @@ class RunCache:
                     neg_mask = _to_tensor(
                         torch, data["negative_mask"], str(data["negative_mask_dtype"])
                     )
+
+            # Basic sanity: embeddings must be 3-D [batch, seq, dim]
+            if positive.ndim != 3:
+                raise ValueError(f"Expected 3-D embed tensor, got shape {positive.shape}")
+            if negative is not None and negative.shape != positive.shape:
+                raise ValueError(
+                    f"positive shape {positive.shape} != negative shape {negative.shape}"
+                )
+
             if pos_mask is not None or neg_mask is not None:
                 print("[cache] Reusing cached prompt embeddings + masks (text encoder skipped)")
                 return (positive, pos_mask, negative, neg_mask)
             print("[cache] Reusing cached prompt embeddings (text encoder skipped)")
             return (positive, negative)
         except Exception as exc:                               # noqa: BLE001
-            print(f"[cache] Cached embeddings unusable ({type(exc).__name__}: {exc})")
+            print(f"[cache] Cached embeddings discarded ({type(exc).__name__}: {exc})")
             self._discard(path)
             return None
 

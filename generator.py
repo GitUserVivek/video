@@ -614,8 +614,10 @@ def _prepare_embeds(
             kwargs["num_videos_per_prompt"] = 1
         if "device" in params:
             kwargs["device"] = encode_device
-        if "max_sequence_length" in params:
-            kwargs["max_sequence_length"] = 128
+        # Do NOT override max_sequence_length — the model's positional embedding
+        # table has a fixed size baked in at training time (226 for CogVideoX-2b
+        # at 720p). Passing max_sequence_length=128 produces embeddings of shape
+        # [1, 128, D] which mismatches the [1, 226, D] positional table → crash.
 
         with torch.inference_mode():
             result = encoder(prompt=prompt, negative_prompt=negative, **kwargs)
@@ -896,13 +898,38 @@ def generate_video(
 
 # ── OOM-safe runner ───────────────────────────────────────────────────────────
 
-def _run_pipeline(pipe, model_id, enhanced_prompt, negative, total_frames,
-                  height, width, num_inference_steps, guidance_scale, generator,
-                  callback=None, embeds=None):
-    """Single pipeline call — shared by both CogVideoX and LTX."""
-    kwargs = dict(
-        prompt=enhanced_prompt,
-        negative_prompt=negative,
+def _build_pipe_kwargs(
+    pipe,
+    enhanced_prompt: str,
+    negative: str,
+    total_frames: int,
+    height: int,
+    width: int,
+    num_inference_steps: int,
+    guidance_scale: float,
+    generator,
+    callback,
+    embeds: dict | None,
+) -> dict:
+    """Build the kwargs dict for a single pipeline call.
+
+    Handles:
+    - embed vs text prompt (mutually exclusive)
+    - LTX-only attention mask kwargs (gated by signature inspection)
+    - Never produces both prompt + prompt_embeds simultaneously
+    """
+    import inspect as _inspect
+
+    # Inspect __call__ signature once to gate LTX-only kwargs
+    try:
+        _pipe_params = set(_inspect.signature(pipe.__call__).parameters)
+    except Exception:
+        _pipe_params = None
+
+    def _accepts(key: str) -> bool:
+        return _pipe_params is None or key in _pipe_params
+
+    kwargs: dict = dict(
         num_frames=total_frames,
         height=height,
         width=width,
@@ -913,100 +940,66 @@ def _run_pipeline(pipe, model_id, enhanced_prompt, negative, total_frames,
     if callback is not None:
         kwargs["callback_on_step_end"] = callback
 
-    # Inspect the pipeline's __call__ signature once so we never pass kwargs it
-    # doesn't accept.  This is the root cause of the CogVideoX crash: the mask
-    # kwargs are LTX-only and CogVideoXPipeline.__call__() rejects them.
-    import inspect as _inspect
-    try:
-        _pipe_params = set(_inspect.signature(pipe.__call__).parameters)
-    except Exception:
-        _pipe_params = None   # unknown — we'll fall back to trial/error
-
-    def _pipe_accepts(key: str) -> bool:
-        return _pipe_params is None or key in _pipe_params
-
     using_embeds = bool(embeds and embeds.get("positive") is not None)
     if using_embeds:
         kwargs["prompt_embeds"] = embeds["positive"]
         if embeds.get("negative") is not None:
             kwargs["negative_prompt_embeds"] = embeds["negative"]
-        # Pipeline rejects having both prompt text and prompt_embeds at once
-        kwargs.pop("prompt", None)
-        kwargs.pop("negative_prompt", None)
-        # Attention masks are LTX-specific — only forward them when the pipeline
-        # actually declares those parameters (avoids the CogVideoX TypeError).
-        if isinstance(embeds, dict):
-            if (embeds.get("prompt_attention_mask") is not None
-                    and _pipe_accepts("prompt_attention_mask")):
-                kwargs["prompt_attention_mask"] = embeds["prompt_attention_mask"]
-            if (embeds.get("negative") is not None
-                    and embeds.get("negative_prompt_attention_mask") is not None
-                    and _pipe_accepts("negative_prompt_attention_mask")):
-                kwargs["negative_prompt_attention_mask"] = embeds["negative_prompt_attention_mask"]
+        # LTX-only mask kwargs — never pass to CogVideoX
+        if embeds.get("prompt_attention_mask") is not None and _accepts("prompt_attention_mask"):
+            kwargs["prompt_attention_mask"] = embeds["prompt_attention_mask"]
+        if (embeds.get("negative") is not None
+                and embeds.get("negative_prompt_attention_mask") is not None
+                and _accepts("negative_prompt_attention_mask")):
+            kwargs["negative_prompt_attention_mask"] = embeds["negative_prompt_attention_mask"]
+    else:
+        kwargs["prompt"]          = enhanced_prompt
+        kwargs["negative_prompt"] = negative
 
-    # Keys that are embedding-related and must all be stripped on fallback
-    _EMBED_KEYS = (
-        "prompt_embeds", "negative_prompt_embeds",
-        "prompt_attention_mask", "negative_prompt_attention_mask",
-    )
+    return kwargs
+
+
+def _run_pipeline(pipe, model_id, enhanced_prompt, negative, total_frames,
+                  height, width, num_inference_steps, guidance_scale, generator,
+                  callback=None, embeds=None):
+    """Single pipeline call — shared by both CogVideoX and LTX.
+
+    Attempt order:
+      1. With pre-computed embeddings (fast — skips text encoder)
+      2. Without embeddings — pure text path (robust fallback)
+
+    The two attempts use completely separate kwargs dicts so there is no risk
+    of a stale prompt + prompt_embeds collision.
+    """
+    using_embeds = bool(embeds and embeds.get("positive") is not None)
 
     with torch.inference_mode():
-        try:
-            return pipe(**kwargs)
-        except (TypeError, RuntimeError) as exc:
-            # Cached embeddings can be rejected (unsupported kwarg, device or dtype
-            # mismatch). Drop them for the whole run and let the pipeline encode
-            # normally — but never swallow an OOM, that is the OOM handler's job.
-            if not using_embeds or _is_cuda_oom(exc):
-                raise
-            print(f"[gen] Cached prompt embeddings rejected "
-                  f"({type(exc).__name__}) — re-encoding on correct device")
-            if embeds is not None:
-                embeds.clear()
-            for _k in _EMBED_KEYS:
-                kwargs.pop(_k, None)
+        if using_embeds:
+            embed_kwargs = _build_pipe_kwargs(
+                pipe, enhanced_prompt, negative,
+                total_frames, height, width,
+                num_inference_steps, guidance_scale, generator,
+                callback, embeds,
+            )
+            try:
+                return pipe(**embed_kwargs)
+            except (TypeError, RuntimeError) as exc:
+                if _is_cuda_oom(exc):
+                    raise
+                print(f"[gen] Cached embeddings rejected ({type(exc).__name__}: "
+                      f"{str(exc)[:120]}) — falling back to text encoding")
+                if embeds is not None:
+                    embeds.clear()
+                # Fall through to text path below
 
-            # Re-encode directly on the text encoder's device to avoid the
-            # cross-device hang that occurs when the pipeline's internal
-            # encode_prompt uses _execution_device (transformer) instead of
-            # the actual text encoder device (may differ under device_map).
-            te_device = _text_encoder_device(pipe)
-            encoder   = getattr(pipe, "encode_prompt", None)
-            if callable(encoder) and te_device is not None:
-                try:
-                    import inspect as _ins
-                    enc_params = _ins.signature(encoder).parameters
-                    enc_kwargs: dict = {}
-                    if "do_classifier_free_guidance" in enc_params:
-                        enc_kwargs["do_classifier_free_guidance"] = guidance_scale > 1.0
-                    if "num_videos_per_prompt" in enc_params:
-                        enc_kwargs["num_videos_per_prompt"] = 1
-                    if "device" in enc_params:
-                        enc_kwargs["device"] = te_device
-                    if "max_sequence_length" in enc_params:
-                        enc_kwargs["max_sequence_length"] = 128
-
-                    enc_result = encoder(
-                        prompt=enhanced_prompt,
-                        negative_prompt=negative,
-                        **enc_kwargs,
-                    )
-                    if isinstance(enc_result, (tuple, list)) and len(enc_result) >= 2:
-                        new_embeds = _place_embeds(pipe, enc_result[0], enc_result[1])
-                        kwargs["prompt_embeds"]          = new_embeds["positive"]
-                        kwargs["negative_prompt_embeds"] = new_embeds["negative"]
-                        # Do NOT restore text prompt — embeds replace it
-                        print("[gen] Re-encoded successfully — proceeding with embeddings")
-                        return pipe(**kwargs)
-                except Exception as enc_exc:
-                    print(f"[gen] Re-encode failed ({enc_exc}) — trying raw text call")
-
-            # Last resort: restore text and let the pipeline handle encoding
-            if "prompt" not in kwargs:
-                kwargs["prompt"] = enhanced_prompt
-            if "negative_prompt" not in kwargs:
-                kwargs["negative_prompt"] = negative
-            return pipe(**kwargs)
+        # Clean text-only call — no embeddings, no stale kwargs
+        text_kwargs = _build_pipe_kwargs(
+            pipe, enhanced_prompt, negative,
+            total_frames, height, width,
+            num_inference_steps, guidance_scale, generator,
+            callback, None,   # None → text path
+        )
+        return pipe(**text_kwargs)
 
 
 def _run_with_oom_recovery(
