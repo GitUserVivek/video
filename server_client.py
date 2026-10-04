@@ -63,6 +63,8 @@ def ensure_server_running(
           f"[client] Use  python main.py --release-resources  to free GPU memory.\n"
           f"[client] Use  python main.py --reset              to stop the server.\n")
 
+    # Always explicitly pass the model so the server never falls back to
+    # auto-selection (which can return ltx-video if CUDA isn't fully init'd yet)
     _start_server_background(model_id)
 
     # Wait for the socket to become available

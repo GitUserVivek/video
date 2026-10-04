@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -188,7 +190,7 @@ def main() -> int:
 
     # ── Server control flags (no model loading needed) ─────────────────────
     if args.reset or args.release_resources or args.server_status:
-        from model_server import is_server_running
+        from model_server import is_server_running, server_pid_path
         from server_client import (
             print_status, release_resources, shutdown_server,
         )
@@ -196,21 +198,60 @@ def main() -> int:
             print("[main] Model server is not running.")
             return 0
 
+        # Fetch current status once — used by multiple branches below
+        try:
+            from server_client import get_status
+            s = get_status()
+        except Exception:
+            s = {}
+
         if args.server_status:
             print_status()
             return 0
 
         if args.release_resources:
+            if s.get("busy"):
+                print("[main] Server is busy — cannot release resources while generating.\n"
+                      "       Use --reset to force-stop the server instead.")
+                return 1
             print("[main] Releasing GPU memory (server stays alive) …")
             release_resources()
             print("[main] Done. Re-run any generation command to reload the model.")
             return 0
 
         if args.reset:
-            print("[main] Releasing resources and stopping server …")
-            release_resources()
-            shutdown_server()
-            print("[main] Server stopped.")
+            pid_file = server_pid_path()
+            pid = None
+            if pid_file.exists():
+                try:
+                    pid = int(pid_file.read_text().strip())
+                except ValueError:
+                    pass
+
+            if s.get("busy"):
+                print("[main] Server is busy (generation running). Force-killing …")
+            else:
+                print("[main] Stopping server …")
+
+            # Try graceful shutdown first (works when not busy)
+            try:
+                shutdown_server()
+            except Exception:
+                pass
+
+            # If still alive (was busy), kill by PID
+            if pid:
+                import time as _t
+                _t.sleep(1.0)
+                try:
+                    os.kill(pid, 0)   # check if still alive
+                    print(f"[main] Server (PID {pid}) still running — sending SIGKILL …")
+                    os.kill(pid, signal.SIGKILL)
+                    pid_file.unlink(missing_ok=True)
+                except ProcessLookupError:
+                    pass  # already dead
+
+            print("[main] Server stopped. GPU memory released.")
             return 0
 
     stream = _apply_fast_preset(args)
@@ -307,14 +348,19 @@ def main() -> int:
 def _run_via_server(args, stream: bool, hw_cfg: dict) -> int:
     """Delegate generation to the persistent model server."""
     from server_client import ensure_server_running, generate
+    from model import select_model
 
-    # Auto-start the server if it isn't running yet
-    ensure_server_running(model_id=args.model)
+    # Resolve model now (in the client process where CUDA is confirmed available)
+    # so the server is told exactly which model to load — never auto-selects blind.
+    model_id = args.model or select_model(hw_cfg)
+
+    # Auto-start the server if it isn't running yet, passing the resolved model
+    ensure_server_running(model_id=model_id)
 
     try:
         output_path = generate(
             prompt              = args.prompt,
-            model               = args.model,
+            model               = model_id,
             duration_sec        = args.duration,
             fps                 = args.fps,
             resolution          = args.resolution,

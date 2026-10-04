@@ -256,12 +256,21 @@ def _ensure_loaded(model_id: str | None) -> None:
             return
 
     from hardware import detect_device
-    from model import load_pipeline
+    from model import load_pipeline, select_model
 
     if not STATE.hw_cfg:
         STATE.hw_cfg = detect_device()
 
-    log.info("Loading pipeline: %s …", model_id or "auto")
+    # Resolve model_id: explicit arg > AI_VIDEO_MODEL env > auto-select.
+    # Auto-select is done AFTER hardware detection so vram_gb is always valid.
+    if model_id is None:
+        model_id = os.environ.get("AI_VIDEO_MODEL") or None
+    if model_id is None:
+        model_id = select_model(STATE.hw_cfg)
+        log.info("Auto-selected model: %s (vram_gb=%.1f)",
+                 model_id, STATE.hw_cfg.get("vram_gb", 0))
+
+    log.info("Loading pipeline: %s …", model_id)
     t0 = time.time()
     pipe, model_info = load_pipeline(model_id, STATE.hw_cfg)
     STATE.pipe       = pipe
@@ -347,6 +356,14 @@ def _handle_connection(conn: socket.socket, addr: Any) -> None:
             log.info("Shutdown requested — exiting.")
             _cleanup_pid()
             os.kill(os.getpid(), signal.SIGTERM)
+        elif action == "force_shutdown":
+            # Hard kill — works even when busy (generation will be interrupted)
+            _send_msg(conn, {"type": "log",  "text": "[server] Force shutdown — killing process."})
+            _send_msg(conn, {"type": "done", "output_path": ""})
+            conn.close()
+            log.info("Force shutdown requested — killing now.")
+            _cleanup_pid()
+            os.kill(os.getpid(), signal.SIGKILL)
         else:
             _send_msg(conn, {"type": "error", "text": f"Unknown action: {action}"})
     except Exception as exc:
