@@ -416,14 +416,27 @@ def _cleanup_pid() -> None:
 
 
 def _preload_model() -> None:
-    """Optionally pre-load the model at server startup (avoids latency on first request)."""
-    model_id = os.environ.get("AI_VIDEO_MODEL")  # e.g. "cogvideox-5b"
+    """Pre-load the model at server startup.
+
+    Only runs if AI_VIDEO_MODEL is explicitly set — never auto-selects,
+    because the server process may start before CUDA is fully initialised
+    and select_model() would return 'ltx-video' (vram_gb=0 fallback),
+    triggering an unwanted 39 GB download.
+
+    If AI_VIDEO_MODEL is not set, skip preload and wait for the first
+    generation request (which always carries an explicit model_id from
+    the client-side select_model() call).
+    """
+    model_id = os.environ.get("AI_VIDEO_MODEL")
+    if not model_id:
+        log.info("Preload skipped — model will load on first request.")
+        return
     if os.environ.get("AI_VIDEO_NO_PRELOAD"):
         log.info("Preload skipped (AI_VIDEO_NO_PRELOAD set).")
         return
     try:
         with STATE.lock:
-            _ensure_loaded(model_id or None)
+            _ensure_loaded(model_id)
     except Exception as exc:
         log.warning("Preload failed: %s — will load on first request.", exc)
 

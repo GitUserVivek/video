@@ -24,25 +24,28 @@ from typing import Any
 def _start_server_background(model_id: str | None = None) -> None:
     """Spawn model_server.py as a detached background process."""
     script = Path(__file__).parent / "model_server.py"
-    cmd = [sys.executable, str(script)]
-    if model_id:
-        cmd += ["--model", model_id]
+    cmd = [sys.executable, str(script), "--no-preload"]  # never auto-select on startup
 
-    # nohup-style: detach from current terminal, redirect output to a log file
     log_path = Path(os.environ.get("AI_VIDEO_SERVER_LOG",
                                    "/tmp/ai_video_server.log"))
-    log_file = open(log_path, "a")  # noqa: WPS515 (intentional persistent handle)
+    log_file = open(log_path, "a")  # noqa: WPS515
+
+    # Pass model via env var so the server knows what to load on first request
+    env = os.environ.copy()
+    if model_id:
+        env["AI_VIDEO_MODEL"] = model_id
 
     kwargs: dict[str, Any] = dict(
         stdout=log_file,
         stderr=log_file,
         stdin=subprocess.DEVNULL,
+        env=env,
     )
 
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     else:
-        kwargs["start_new_session"] = True   # detach from parent's process group
+        kwargs["start_new_session"] = True
 
     proc = subprocess.Popen(cmd, **kwargs)
     print(f"[client] Server started (PID {proc.pid})  log → {log_path}")

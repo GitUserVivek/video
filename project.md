@@ -110,3 +110,12 @@ Loads each requested model, probes a small number of denoising steps plus one VA
 6. Each finished pass is cached; if streaming, each pass is written and shown immediately.
 7. Segments are cross-dissolved, the clip is retimed to the requested duration if needed, and the final MP4 is written and shown.
 8. If the idle guard is active, the process stays alive so another generation can be run interactively; otherwise it exits. The idle guard unloads the model after the timeout, and reloads it transparently on the next `get_pipe()` call.
+
+
+  Speed vs Quality Trade-off for Your Hardware
+
+  Quality  │  cogvideox-2b 50 steps   ████████████████████  25–30 min
+           │  cogvideox-2b 25 steps   ████████████████░░░░  13 min
+           │  ltx-video 20 steps      ████████████░░░░░░░░  5 min
+           │  ltx-video-distilled     ████████░░░░░░░░░░░░  1–2 min
+  Speed    └─────────────────────────────────────────────▶
