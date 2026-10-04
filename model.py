@@ -165,33 +165,38 @@ def _check_version_for_model(model_id: str) -> None:
 def select_model(hw_cfg: dict) -> str:
     """Choose the best model for the detected hardware.
 
-    Key insight: CogVideoX-5b weights are ~20 GB in fp16. On multi-GPU setups
-    accelerate shards those weights evenly across all GPUs, so the per-GPU
-    weight footprint drops to ~10 GB on 2× T4. The attention activations are
-    kept in check by the chunked attention patch.
+    Critical distinction: with device_map="balanced" the transformer *weights*
+    are split across N GPUs, but the attention *activations* (hidden states,
+    QKV projections, layer-norm intermediates) are computed and held on whichever
+    GPU owns each block. accelerate's AlignDevicesHook moves tensors between GPUs
+    at block boundaries, but within a block the full activation tensor lives on
+    one GPU. This means the bottleneck is always per-GPU VRAM, not total VRAM.
 
-    Safe model choices per GPU tier:
-      Single GPU  ≥ 24 GB  (A100/H100)  → cogvideox-5b  (weights + activations fit)
-      Multi-GPU   total ≥ 24 GB         → cogvideox-5b  (sharded via device_map)
-      Single GPU  10–23 GB              → cogvideox-2b
-      Multi-GPU   total 10–23 GB        → cogvideox-2b
-      < 10 GB / CPU / MPS               → ltx-video
+    cogvideox-5b activation budget (fp16, 480p, 49 frames):
+        QKV projections : ~1.5 GB/layer  ×  42 layers
+        Worst single GPU: ~8–10 GB activations + ~10 GB weight shard = ~18–20 GB
+        → needs ≥ 24 GB per GPU to be safe at any useful resolution
+
+    cogvideox-2b activation budget (fp16, 720p, 49 frames):
+        ~3–4 GB activations + ~5 GB weight shard = ~8–9 GB
+        → comfortable on a single 15.6 GB T4
+
+    Safe model choices:
+      Per-GPU VRAM ≥ 24 GB  (A100 80G, H100)   → cogvideox-5b
+      Per-GPU VRAM ≥ 10 GB  (T4, 3090, etc.)   → cogvideox-2b
+      Per-GPU VRAM  < 10 GB, MPS, or CPU        → ltx-video
     """
-    device         = hw_cfg["device"]
-    vram_gb        = hw_cfg.get("vram_gb", 0)        # single GPU VRAM
-    total_vram_gb  = hw_cfg.get("total_vram_gb", vram_gb)
-    gpu_count      = hw_cfg.get("gpu_count", 1)
+    device    = hw_cfg["device"]
+    vram_gb   = hw_cfg.get("vram_gb", 0)   # per-GPU VRAM (GPU 0)
 
     if device in ("cpu", "mps") or not _HAS_COGVIDEOX:
         return "ltx-video"
 
-    # For model selection always judge by total available VRAM.
-    effective = total_vram_gb if gpu_count > 1 else vram_gb
-
-    if effective >= 24:
+    # Always gate on per-GPU VRAM — activations never shard.
+    if vram_gb >= 24:
         return "cogvideox-5b"
 
-    if effective >= 10:
+    if vram_gb >= 10:
         return "cogvideox-2b"
 
     return "ltx-video"

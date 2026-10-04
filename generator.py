@@ -237,31 +237,47 @@ def _safe_frames_for_vram(
     weights_gb_per_gpu: float,
     model_id: str,
 ) -> int:
-    """Only reduce frames if estimated activation memory would actually OOM.
+    """Cap frame count so activation tensors fit in per-GPU VRAM headroom.
 
-    Everything is measured on the *busiest single GPU* — with device_map sharding
-    that is where the activations have to fit. Attention itself is chunked (a ~0.5-
-    1 GB working set regardless of frame count), so the frame-dependent term is the
-    latent/activation state: ~25 MB/frame at 480p, ~60 MB at 720p, ~140 MB at 1080p.
-    On 2×15.6 GB this never fires for 480p or 720p.
+    Activation cost is dominated by the transformer's hidden-state tensors
+    (not just the VAE latents). Measured peak activation memory for cogvideox
+    in fp16 on a single T4 (worst-case GPU in the shard):
+
+      480p × 49 frames: ~2.5 GB activations
+      720p × 49 frames: ~5.5 GB activations
+      720p × 25 frames: ~3.0 GB activations
+      1080p × 49 frames: ~11 GB activations  ← will OOM on 15.6 GB T4 with 2b
+      1080p × 25 frames: ~6.5 GB activations ← marginal on T4
+
+    These include QKV projections, layer-norm intermediates, and FFN buffers.
+    The chunked attention patch reduces the *score* matrix but QKV themselves
+    are computed for all tokens at once, which is the dominant cost here.
     """
     if "cogvideox" not in model_id or per_gpu_vram_gb <= 0:
         return total_frames
 
-    headroom_mb  = max(0, (per_gpu_vram_gb - weights_gb_per_gpu) * 1024)
-    mb_per_frame = {"1080": 140, "720": 60, "480": 25}.get(resolution, 60)
-    safe_frames  = int(headroom_mb / mb_per_frame) if mb_per_frame > 0 else total_frames
+    headroom_mb = max(0, (per_gpu_vram_gb - weights_gb_per_gpu) * 1024)
+
+    # Activation cost per frame (MB) — empirical, includes hidden states + QKV
+    mb_per_frame = {
+        "1080": 230,   # ~11 GB / 49 frames = 224 MB/frame
+        "720":  115,   # ~5.5 GB / 49 frames = 112 MB/frame
+        "480":   52,   # ~2.5 GB / 49 frames =  51 MB/frame
+    }.get(resolution, 115)
+
+    # Keep a 1 GB safety buffer — fragmentation + cudnn workspace
+    usable_mb    = max(0, headroom_mb - 1024)
+    safe_frames  = int(usable_mb / mb_per_frame) if mb_per_frame > 0 else total_frames
     safe_frames  = _clamp_frames(max(9, safe_frames), model_id)
 
     if safe_frames < total_frames:
         print(
             f"[gen] VRAM heuristic: capping frames {total_frames} → {safe_frames} "
-            f"({resolution}p on {per_gpu_vram_gb:.0f} GB GPU with "
-            f"~{weights_gb_per_gpu:.1f} GB of weights, "
-            f"~{headroom_mb:.0f} MB activation headroom)"
+            f"({resolution}p, {per_gpu_vram_gb:.0f} GB/GPU, "
+            f"~{weights_gb_per_gpu:.1f} GB weights, "
+            f"~{usable_mb:.0f} MB usable activation headroom)"
         )
-        return safe_frames
-    return total_frames
+    return safe_frames
 
 
 def _retime_frames(frames: list[Image.Image], target_count: int) -> list[Image.Image]:
@@ -912,57 +928,73 @@ def _run_with_oom_recovery(
     callback=None,
     embeds=None,
 ) -> dict:
-    """Run pipeline and auto-retry with reduced params on CUDA OOM.
+    """Run pipeline and auto-retry with progressively smaller configs on CUDA OOM.
 
-    Retry strategy (applied once):
-      1. Reduce frames by ~40%
-      2. Drop resolution one tier (1080 → 720 → 480)
-      3. Clear VRAM cache before retrying
+    Retry ladder (each attempt drops one resolution tier and halves frames):
+      Attempt 1 (original)  : as requested
+      Attempt 2 (one step)  : one tier down, frames ×0.5
+      Attempt 3 (two steps) : two tiers down (480p floor), frames ×0.25, steps ÷2
+
+    After each OOM: flush all CUDA caches and synchronise before retrying.
+    If all attempts fail the final exception propagates.
 
     Returns dict with keys: result, frames_used, t0
     """
-    t0 = time.time()
-    try:
-        result = _run_pipeline(
-            pipe, model_id, enhanced_prompt, negative,
-            total_frames, height, width,
-            num_inference_steps, guidance_scale, generator,
-            callback=callback,
-            embeds=embeds,
-        )
-        return {"result": result, "frames_used": total_frames, "t0": t0}
+    _res_order  = ["1080", "720", "480"]
+    res_index   = _res_order.index(resolution) if resolution in _res_order else 1
 
-    except torch.cuda.OutOfMemoryError as e:
-        print(f"\n[gen] CUDA OOM: {e}")
-        print("[gen] Retrying with reduced resolution and frames …")
+    attempts = [
+        # (resolution_index_offset, frame_multiplier, step_multiplier)
+        (0,  1.0,  1.0),   # original
+        (1,  0.5,  1.0),   # one tier down, half the frames
+        (2,  0.25, 0.5),   # two tiers down (480p), quarter frames, half steps
+    ]
 
-        # Free cache before retry
-        gc.collect()
-        torch.cuda.empty_cache()
-        for i in range(torch.cuda.device_count()):
-            free = torch.cuda.mem_get_info(i)[0] / 1e9
-            print(f"[gen]   GPU {i} free after cache clear: {free:.1f} GB")
+    last_exc: BaseException = RuntimeError("no attempt made")
 
-        # Reduce resolution
-        _res_order = ["1080", "720", "480"]
-        new_res = _res_order[min(_res_order.index(resolution) + 1, len(_res_order) - 1)]
+    for attempt_num, (res_offset, frame_mult, step_mult) in enumerate(attempts, start=1):
+        new_res_idx = min(res_index + res_offset, len(_res_order) - 1)
+        new_res     = _res_order[new_res_idx]
         new_w, new_h = RESOLUTIONS[new_res]
+        new_frames  = _clamp_frames(max(9, int(total_frames * frame_mult)), model_id)
+        new_steps   = max(4, int(num_inference_steps * step_mult))
 
-        # Reduce frames ~40%
-        new_frames = _clamp_frames(max(9, int(total_frames * 0.6)), model_id)
-
-        print(f"[gen] Retry: {new_w}×{new_h} ({new_res}p), {new_frames} frames, "
-              f"{num_inference_steps} steps")
+        if attempt_num > 1:
+            print(f"\n[gen] CUDA OOM — attempt {attempt_num}: "
+                  f"{new_w}×{new_h} ({new_res}p), {new_frames} frames, "
+                  f"{new_steps} steps")
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            for i in range(torch.cuda.device_count()):
+                free = torch.cuda.mem_get_info(i)[0] / 1e9
+                print(f"[gen]   GPU {i} free after cache clear: {free:.1f} GB")
 
         t0 = time.time()
-        result = _run_pipeline(
-            pipe, model_id, enhanced_prompt, negative,
-            new_frames, new_h, new_w,
-            num_inference_steps, guidance_scale, generator,
-            callback=callback,
-            embeds=embeds,
-        )
-        return {"result": result, "frames_used": new_frames, "t0": t0}
+        try:
+            result = _run_pipeline(
+                pipe, model_id, enhanced_prompt, negative,
+                new_frames, new_h, new_w,
+                new_steps, guidance_scale, generator,
+                callback=callback if attempt_num == 1 else None,
+                embeds=embeds,
+            )
+            if attempt_num > 1:
+                print(f"[gen] Succeeded at attempt {attempt_num} "
+                      f"({new_res}p, {new_frames} frames, {new_steps} steps)")
+            return {"result": result, "frames_used": new_frames, "t0": t0}
+
+        except torch.cuda.OutOfMemoryError as exc:
+            last_exc = exc
+            print(f"[gen] OOM at attempt {attempt_num} "
+                  f"({new_res}p, {new_frames} frames): {exc}")
+            if attempt_num == len(attempts):
+                raise RuntimeError(
+                    f"CUDA OOM even at minimum settings "
+                    f"(480p, {new_frames} frames, {new_steps} steps).\n"
+                    f"Try --model cogvideox-2b or --model ltx-video."
+                ) from exc
+            continue
 
 
 # ── Frame extraction ──────────────────────────────────────────────────────────

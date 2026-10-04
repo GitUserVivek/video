@@ -73,11 +73,18 @@ def detect_device() -> dict:
         # compute capability instead of the VRAM size.
         compute_major = torch.cuda.get_device_capability(0)[0]
 
-        # For multi-GPU: use total VRAM for resolution/model tier thresholds.
-        # Thresholds (multi-GPU friendly):
-        #   ≥ 24 GB total → 1080p  (e.g. 2×15 GB = 30 GB → 1080p ✓)
-        #   ≥ 12 GB total → 720p   (e.g. single 15 GB → 720p ✓)
-        #   < 12 GB       → 480p
+        # For multi-GPU: weights shard across GPUs but activations do NOT.
+        # Resolution/model tier must be gated on per-GPU VRAM (vram_gb),
+        # not total VRAM, to avoid OOMs from oversized activation tensors.
+        #
+        # T4 (15.6 GB) with cogvideox-2b (~5 GB weight shard):
+        #   ~10 GB activation headroom → safe at 720p
+        #   1080p activation peak ~8–10 GB → marginal, use 720p as safe cap
+        #
+        # Thresholds (per-GPU):
+        #   ≥ 24 GB  → 1080p  (A100/H100 — activations fit comfortably)
+        #   ≥ 10 GB  → 720p   (T4/3090 — safe for cogvideox-2b)
+        #   < 10 GB  → 480p
         return {
             "device": "cuda",
             "dtype": torch.bfloat16 if compute_major >= 8 else torch.float16,
@@ -92,13 +99,13 @@ def detect_device() -> dict:
             "use_device_map": gpu_count > 1,
             "threads": None,
             "max_resolution": (
-                "1080" if effective_vram >= 24
-                else "720" if effective_vram >= 12
+                "1080" if vram_gb >= 24
+                else "720" if vram_gb >= 10
                 else "480"
             ),
             "max_model_size": (
-                "14B" if effective_vram >= 24
-                else "7B" if effective_vram >= 12
+                "14B" if vram_gb >= 24
+                else "7B" if vram_gb >= 10
                 else "1.3B"
             ),
         }
