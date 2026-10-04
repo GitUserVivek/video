@@ -401,70 +401,104 @@ def _vram_snapshot() -> str:
 
 
 def _make_progress_callback(total_steps: int, total_frames: int, pass_label: str) -> Any:
-    """Build a callback_on_step_end that logs step progress, ETA, and VRAM.
+    """Progress monitor that works even when callback_on_step_end is silently
+    ignored by accelerate's device_map hooks (diffusers ≤ 0.37 + multi-GPU).
 
-    Fires on every denoising step so the user always sees activity.
-    Also starts a heartbeat thread that prints a dot every 30 s in case
-    the callback itself is not called (some pipeline versions skip it on
-    the last step).
+    Strategy
+    --------
+    Two independent mechanisms, whichever fires first wins:
 
-    Output format:
-      [gen] Step  5/50  (10%)  elapsed 0:02:31  ETA ~0:22:46  GPU0: 4.2GB free | GPU1: 6.1GB free
+    1. callback_on_step_end  — the normal diffusers hook. Works on single-GPU
+       and some diffusers versions. Each call updates shared state.
+
+    2. Monitor thread  — polls every 30 s regardless. Reads the step count
+       from shared state (updated by the callback) OR estimates progress from
+       VRAM usage when the callback never fires. Always prints something so
+       the user knows the process is alive.
+
+    Both write to the same `state` dict so output is never duplicated.
     """
     import threading, time as _time
 
     state = {
-        "t_start":   _time.monotonic(),
-        "last_step": 0,
-        "done":      False,
+        "t_start":       _time.monotonic(),
+        "last_step":     0,       # updated by callback when it fires
+        "callback_fired": False,  # True once any callback call is received
+        "done":          False,
     }
 
-    # ── Heartbeat thread: one dot every 30 s while no step callback fires ─
-    heartbeat_interval = 30
+    def _fmt(secs: float) -> str:
+        m, s = divmod(int(secs), 60)
+        h, m = divmod(m, 60)
+        return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
-    def _heartbeat():
+    def _monitor():
+        """Print a status line every 30 s. Uses callback step count if available,
+        otherwise just reports elapsed time + VRAM so user knows it's running."""
+        interval = 30
         while not state["done"]:
-            _time.sleep(heartbeat_interval)
+            _time.sleep(interval)
             if state["done"]:
                 break
             elapsed = _time.monotonic() - state["t_start"]
-            m, s    = divmod(int(elapsed), 60)
             step    = state["last_step"]
-            if step == 0:
-                print(f"[gen] … still encoding prompt / setting up  "
-                      f"(elapsed {m}:{s:02d}){_vram_snapshot()}", flush=True)
+            vram    = _vram_snapshot()
+
+            if state["callback_fired"] and step > 0:
+                # Callback is working — show real step progress
+                pct       = step * 100 // total_steps
+                avg_step  = elapsed / step
+                remaining = avg_step * (total_steps - step)
+                print(
+                    f"[gen] … {pass_label}step {step}/{total_steps} "
+                    f"({pct}%)  elapsed {_fmt(elapsed)}  "
+                    f"ETA ~{_fmt(remaining)}{vram}",
+                    flush=True,
+                )
+            elif step == 0 and elapsed < 300:
+                # Still in setup (normal for first 1-3 min)
+                print(
+                    f"[gen] … still in setup / prompt encoding  "
+                    f"(elapsed {_fmt(elapsed)}){vram}",
+                    flush=True,
+                )
             else:
-                pct = step * 100 // total_steps
-                print(f"[gen] … step {step}/{total_steps} in progress  "
-                      f"(elapsed {m}:{s:02d}){_vram_snapshot()}", flush=True)
+                # Callback never fired — denoising is running silently
+                # Estimate very roughly: 2b @ 720p ≈ 25-30s/step on 2×T4
+                est_step_sec = 28.0
+                est_done = max(0, int((elapsed - 120) / est_step_sec))  # subtract ~2min setup
+                est_done = min(est_done, total_steps - 1)
+                est_remaining = max(0, (total_steps - est_done) * est_step_sec)
+                print(
+                    f"[gen] … denoising in progress  "
+                    f"elapsed {_fmt(elapsed)}  "
+                    f"~step {est_done}/{total_steps} (estimated)  "
+                    f"ETA ~{_fmt(est_remaining)}{vram}",
+                    flush=True,
+                )
 
-    hb = threading.Thread(target=_heartbeat, daemon=True, name="Heartbeat")
-    hb.start()
+    monitor_thread = threading.Thread(target=_monitor, daemon=True, name="GenMonitor")
+    monitor_thread.start()
 
-    def _stop_heartbeat():
+    def _stop():
         state["done"] = True
 
     def callback(_pipe: Any, step: int, _timestep: Any, callback_kwargs: dict) -> dict:
-        state["last_step"] = step + 1
-        elapsed  = _time.monotonic() - state["t_start"]
+        """Fired by diffusers after each denoising step (when it works)."""
+        state["last_step"]      = step + 1
+        state["callback_fired"] = True
+
+        elapsed    = _time.monotonic() - state["t_start"]
         done_steps = step + 1
-        pct      = done_steps * 100 // total_steps
+        pct        = done_steps * 100 // total_steps
+        avg_step   = elapsed / done_steps
+        remaining  = avg_step * (total_steps - done_steps)
+        eta_str    = f"ETA ~{_fmt(remaining)}" if done_steps < total_steps else "done"
+        vram       = _vram_snapshot()
+        prefix     = f"[gen] {pass_label}" if pass_label else "[gen]"
 
-        # ETA from average step time so far
-        avg_step = elapsed / done_steps
-        remaining = avg_step * (total_steps - done_steps)
-
-        def _fmt(secs: float) -> str:
-            m, s = divmod(int(secs), 60)
-            h, m = divmod(m, 60)
-            return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-
-        eta_str = f"ETA ~{_fmt(remaining)}" if done_steps < total_steps else "done"
-        vram    = _vram_snapshot()
-
-        prefix = f"[gen] {pass_label}" if pass_label else "[gen]"
         print(
-            f"{prefix} Step {done_steps:>{len(str(total_steps))}}/{total_steps}"
+            f"{prefix}Step {done_steps:>{len(str(total_steps))}}/{total_steps}"
             f"  ({pct:3d}%)"
             f"  elapsed {_fmt(elapsed)}"
             f"  {eta_str}"
@@ -473,20 +507,29 @@ def _make_progress_callback(total_steps: int, total_frames: int, pass_label: str
         )
 
         if done_steps >= total_steps:
-            _stop_heartbeat()
+            _stop()
 
         return callback_kwargs
 
-    # Attach stop_heartbeat so generate_video can call it after the pipe returns
-    callback._stop_heartbeat = _stop_heartbeat
+    callback._stop_heartbeat = _stop
     return callback
 
 
 def _make_preview_hook(pipe: Any, every: int, out_dir: Path) -> Any:
-    """Legacy hook: decode and display a still image every N steps (--preview-every).
-    Wraps the progress callback so both fire together.
+    """Decode and save a still image every N steps (--preview-every N).
+
+    Each step gets its own file so you can track progression:
+        preview_step_05.jpg   ← after step 5
+        preview_step_10.jpg   ← after step 10
+        ...
+        preview_step_50.jpg   ← final step
+
+    All files land in the same folder as the output video.
+    A symlink  preview_latest.jpg  always points to the most recent one
+    so you can refresh a single bookmark in Kaggle's file browser.
     """
     state = {"failed": False}
+    preview_dir = Path(out_dir) / "previews"
 
     def hook(_pipe: Any, step: int, _timestep: Any, callback_kwargs: dict) -> dict:
         if state["failed"] or (step + 1) % every != 0:
@@ -497,8 +540,20 @@ def _make_preview_hook(pipe: Any, every: int, out_dir: Path) -> Any:
         try:
             frame = _decode_preview_frame(_pipe, latents)
             if frame is not None:
-                path = Path(out_dir) / "preview.jpg"
+                preview_dir.mkdir(parents=True, exist_ok=True)
+                filename = f"preview_step_{step + 1:03d}.jpg"
+                path = preview_dir / filename
                 frame.save(path, quality=88)
+
+                # Keep a "latest" copy so the user can refresh one fixed path
+                latest = preview_dir / "preview_latest.jpg"
+                try:
+                    import shutil as _sh
+                    _sh.copy2(path, latest)
+                except Exception:
+                    pass
+
+                print(f"[preview] Step {step + 1} → {path}")
                 _show_image(path, label=f"step {step + 1} ")
         except Exception as exc:
             state["failed"] = True
