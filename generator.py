@@ -106,14 +106,14 @@ SEGMENT_FADE = 4           # frames of cross-dissolve hiding a segment boundary
 _RES_ORDER = ["480", "720", "1080"]
 
 # `--fast` preset: use ltx-video (already downloaded, ~8 GB) with reduced steps.
-# Distilled checkpoints are not bundled because they require a separate HF repo
-# that changes frequently — point LTX_DISTILLED_REPO at one if you have it.
+# On 2×15 GB the default resolution will already be 720p from hw_cfg.
+# resolution=None means "inherit from hw_cfg max_resolution" at runtime.
 FAST_PRESET: dict[str, Any] = {
     "model":      "ltx-video",
     "steps":      20,
     "guidance":   3.0,
     "fps":        24,
-    "resolution": "480",
+    "resolution": None,    # None → use hw_cfg["max_resolution"] (720p on 2×15 GB)
     "stream":     True,
 }
 
@@ -636,9 +636,10 @@ def generate_video(
         found = ", ".join(f"{k}={v}" for k, v in hints.items())
         print(f"[gen] Prompt hints detected: {found}")
 
-    # ── Resolution: CLI flag > prompt hint > default (480p) ──────────────
+    # ── Resolution: CLI flag > prompt hint > hw_cfg max > 480p fallback ──
+    hw_max_res = hw_cfg.get("max_resolution", DEFAULT_RESOLUTION)
     if resolution is None:
-        resolution = hints.get("resolution") or DEFAULT_RESOLUTION
+        resolution = hints.get("resolution") or hw_max_res
     if resolution not in RESOLUTIONS:
         raise ValueError(f"resolution must be one of {list(RESOLUTIONS.keys())}")
 

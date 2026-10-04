@@ -165,29 +165,33 @@ def _check_version_for_model(model_id: str) -> None:
 def select_model(hw_cfg: dict) -> str:
     """Choose the best model for the detected hardware.
 
-    Key insight: CogVideoX-5b's 3D attention materialises QKᵀ matrices that
-    are O(T×H×W)² in size. On T4-class GPUs (15 GB each) this OOMs during the
-    forward pass regardless of how many GPUs hold the weights.
+    Key insight: CogVideoX-5b weights are ~20 GB in fp16. On multi-GPU setups
+    accelerate shards those weights evenly across all GPUs, so the per-GPU
+    weight footprint drops to ~10 GB on 2× T4. The attention activations are
+    kept in check by the chunked attention patch.
 
     Safe model choices per GPU tier:
       Single GPU  ≥ 24 GB  (A100/H100)  → cogvideox-5b  (weights + activations fit)
-      Multi-GPU   any config             → cogvideox-2b  (lighter attention, safe)
+      Multi-GPU   total ≥ 24 GB         → cogvideox-5b  (sharded via device_map)
       Single GPU  10–23 GB              → cogvideox-2b
+      Multi-GPU   total 10–23 GB        → cogvideox-2b
       < 10 GB / CPU / MPS               → ltx-video
     """
-    device     = hw_cfg["device"]
-    vram_gb    = hw_cfg.get("vram_gb", 0)        # single GPU VRAM
-    gpu_count  = hw_cfg.get("gpu_count", 1)
+    device         = hw_cfg["device"]
+    vram_gb        = hw_cfg.get("vram_gb", 0)        # single GPU VRAM
+    total_vram_gb  = hw_cfg.get("total_vram_gb", vram_gb)
+    gpu_count      = hw_cfg.get("gpu_count", 1)
 
     if device in ("cpu", "mps") or not _HAS_COGVIDEOX:
         return "ltx-video"
 
-    # cogvideox-5b only safe on a single high-VRAM GPU (≥24 GB) where
-    # both weights (~17 GB) AND attention activations (~6 GB+) fit together
-    if gpu_count == 1 and vram_gb >= 24:
+    # For model selection always judge by total available VRAM.
+    effective = total_vram_gb if gpu_count > 1 else vram_gb
+
+    if effective >= 24:
         return "cogvideox-5b"
 
-    if vram_gb >= 10:
+    if effective >= 10:
         return "cogvideox-2b"
 
     return "ltx-video"

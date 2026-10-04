@@ -137,8 +137,9 @@ def _apply_fast_preset(args) -> bool:
     stream = args.stream
     if args.fast:
         from generator import FAST_PRESET
+        res_display = FAST_PRESET['resolution'] or "hw-auto"
         print(f"[main] --fast preset: {FAST_PRESET['model']}, {FAST_PRESET['steps']} steps, "
-              f"guidance {FAST_PRESET['guidance']}, {FAST_PRESET['resolution']}p @ "
+              f"guidance {FAST_PRESET['guidance']}, {res_display} @ "
               f"{FAST_PRESET['fps']} fps, streaming\n")
         if args.model is None:
             args.model = FAST_PRESET["model"]
@@ -150,7 +151,12 @@ def _apply_fast_preset(args) -> bool:
             # non-distilled model looks broken, so keep that model's own schedule.
             print(f"[main] --fast with --model {args.model}: keeping its own "
                   f"step/guidance defaults (only resolution + streaming apply)\n")
-        if args.resolution is None: args.resolution = FAST_PRESET["resolution"]
+        # Only apply the preset resolution when it is set AND the user did not
+        # specify one explicitly.  When FAST_PRESET["resolution"] is None the
+        # generator will fall through to hw_cfg["max_resolution"].
+        preset_res = FAST_PRESET["resolution"]
+        if args.resolution is None and preset_res is not None:
+            args.resolution = preset_res
         if stream is None:          stream = FAST_PRESET["stream"]
 
     return bool(stream)
@@ -206,6 +212,22 @@ def main() -> int:
         if not args.prompt:
             print(f"Error: no prompt text found in script file: {script_path}")
             return 1
+
+    # ── Strip timestamp markers from prompt ────────────────────────────────
+    # Handles patterns like [00:00], [00:05], [1:30], (00:00), etc. that appear
+    # in screenplay-style prompts.  These cause SyntaxErrors when Python tries
+    # to evaluate the brackets, and they confuse the model anyway.
+    if args.prompt:
+        import re as _re
+        _TS_RE = _re.compile(r"[\[\(]\d{1,2}:\d{2}[\]\)]\s*")
+        cleaned = _TS_RE.sub("", args.prompt)
+        if cleaned != args.prompt:
+            # Collapse whitespace/newlines left behind, re-join into one sentence
+            lines_clean = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+            args.prompt = " ".join(lines_clean)
+            print(f"[main] Timestamp markers stripped from prompt.\n"
+                  f"[main] Cleaned prompt: {args.prompt[:120]}"
+                  f"{'…' if len(args.prompt) > 120 else ''}\n")
 
     # ── Prompt required from here ──────────────────────────────────────────
     if not args.prompt:

@@ -73,6 +73,11 @@ def detect_device() -> dict:
         # compute capability instead of the VRAM size.
         compute_major = torch.cuda.get_device_capability(0)[0]
 
+        # For multi-GPU: use total VRAM for resolution/model tier thresholds.
+        # Thresholds (multi-GPU friendly):
+        #   ≥ 24 GB total → 1080p  (e.g. 2×15 GB = 30 GB → 1080p ✓)
+        #   ≥ 12 GB total → 720p   (e.g. single 15 GB → 720p ✓)
+        #   < 12 GB       → 480p
         return {
             "device": "cuda",
             "dtype": torch.bfloat16 if compute_major >= 8 else torch.float16,
@@ -87,13 +92,13 @@ def detect_device() -> dict:
             "use_device_map": gpu_count > 1,
             "threads": None,
             "max_resolution": (
-                "1080" if effective_vram >= 18
-                else "720" if effective_vram >= 10
+                "1080" if effective_vram >= 24
+                else "720" if effective_vram >= 12
                 else "480"
             ),
             "max_model_size": (
-                "14B" if effective_vram >= 18
-                else "7B" if effective_vram >= 10
+                "14B" if effective_vram >= 24
+                else "7B" if effective_vram >= 12
                 else "1.3B"
             ),
         }
