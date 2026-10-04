@@ -53,6 +53,10 @@ def _build_parser() -> argparse.ArgumentParser:
                    nargs="?",
                    default=None,
                    help="Text description of the video to generate.")
+    p.add_argument("--script",
+                   default=None,
+                   help="Path to a script file containing scene lines. "
+                        "Use one line per scene; the file is joined into a single prompt.")
     p.add_argument("--model",        default=None,
                    help="Model ID (e.g. cogvideox-2b, cogvideox-5b, ltx-video). "
                         "Auto-selected if omitted.")
@@ -181,6 +185,35 @@ def main() -> int:
         from cache import clear_cache
         clear_cache(args.cache_dir)
 
+    # ── Build prompt from positional arg and/or script file ───────────────
+    if args.script:
+        script_path = Path(args.script)
+        if not script_path.exists():
+            print(f"Error: script file not found: {script_path}")
+            return 1
+        try:
+            text = script_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            print(f"Error: cannot read script file {script_path}: {exc}")
+            return 1
+        # Lines starting with a timestamp-like marker are treated as scene lines.
+        # Everything is joined into one prompt, preserving scene order.
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            print(f"Error: script file is empty: {script_path}")
+            return 1
+        args.prompt = "\n".join(lines)
+        if not args.prompt:
+            print(f"Error: no prompt text found in script file: {script_path}")
+            return 1
+
+    # ── Prompt required from here ──────────────────────────────────────────
+    if not args.prompt:
+        parser.print_help()
+        print("\nError: a prompt is required.\n"
+              "  Example: python main.py \"a sunset over the ocean\"")
+        return 1
+
     # ── Benchmark mode: measure instead of generating ──────────────────────
     if args.benchmark:
         from benchmark import run_benchmark
@@ -192,13 +225,6 @@ def main() -> int:
             prompt=args.prompt or "a 480p sunset timelapse, high quality, cinematic lighting",
         )
         return 0
-
-    # ── Prompt required from here ──────────────────────────────────────────
-    if not args.prompt:
-        parser.print_help()
-        print("\nError: a prompt is required.\n"
-              "  Example: python main.py \"a sunset over the ocean\"")
-        return 1
 
     if args.duration is not None and not (1.0 <= args.duration <= 60.0):
         print(f"Error: --duration must be between 1 and 60 seconds (got {args.duration}).")
