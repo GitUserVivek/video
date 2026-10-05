@@ -745,24 +745,27 @@ def _apply_optimisations(pipe: Any, hw_cfg: dict, model_id: str) -> Any:
             if not xformers_ok:
                 if is_multi_gpu and is_2b:
                     # cogvideox-2b on multi-GPU with device_map="balanced":
-                    # Chunked attention is still needed to avoid the N² score matrix
-                    # OOM (720p/49 frames → ~14k tokens → 7 GB score matrix).
-                    # BUT: small chunks (512) cause extreme slowdown because every
-                    # chunk iteration triggers accelerate's AlignDevicesHook
-                    # (cross-GPU tensor copy). 14400/512 = 28 iters × 30 layers
-                    # × cross-GPU sync ≈ 3-5 min/step.
+                    # Do NOT apply the chunked attention patch.
                     #
-                    # Fix: use ONE large chunk = full sequence length.
-                    # This makes chunked attention behave identically to native
-                    # SDPA (single matmul, no loop overhead) while still going
-                    # through our wrapper. The score matrix peaks at ~512 MB
-                    # which fits fine on T4 with weights sharded.
-                    seq_len    = 14626   # 720p/49f tokens (text + video)
-                    chunk_size = seq_len  # single chunk = no loop overhead
-                    print(f"[model] Multi-GPU + cogvideox-2b: chunked attention "
-                          f"with chunk_size={chunk_size} (single pass, no sync overhead)")
-                    _apply_chunked_attention(pipe, vram_gb,
-                                             chunk_size_override=chunk_size)
+                    # Reason: the patch replaces F.scaled_dot_product_attention with
+                    # a Python-level chunked loop that bypasses PyTorch's fused Flash
+                    # Attention kernel. On multi-GPU with device_map, every iteration
+                    # of that loop interacts with accelerate's AlignDevicesHook
+                    # (cross-GPU tensor moves). Even with chunk_size=full_seq_len
+                    # (single iteration), the explicit matmul + manual float32
+                    # softmax + explicit del runs 10-30× slower than the fused kernel,
+                    # causing 10+ min/step on 2× T4.
+                    #
+                    # Native PyTorch SDPA (Flash Attention on sm_75/Turing) handles
+                    # the cogvideox-2b sequence length at 720p (≈14k tokens) without
+                    # OOM when weights are sharded across 2 GPUs — the KV tensors
+                    # live on both GPUs and the activation headroom per GPU is
+                    # sufficient. The score matrix for one head is:
+                    #   14626 × 14626 × 2 bytes = 428 MB  (fp16)
+                    # Flash Attention tiles this so peak SRAM usage is <<1 GB.
+                    print(f"[model] Multi-GPU + cogvideox-2b: using native PyTorch SDPA "
+                          f"(Flash Attention) — chunked patch skipped to avoid "
+                          f"cross-GPU sync overhead")
                 else:
                     chunked_ok = _apply_chunked_attention(pipe, vram_gb)
                     if not chunked_ok:

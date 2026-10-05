@@ -230,7 +230,10 @@ def _run_screenplay(args, hw_cfg: dict) -> int:
     print(f"[screenplay] Model ready in {time.time() - t_load:.1f}s\n")
 
     # ── Resolve shared generation params ──────────────────────────────────
-    fps      = args.fps or 8
+    # fps: CLI flag > model's native default (e.g. 24 for LTX, 8 for CogVideoX)
+    # Do NOT fall back to 8 here — that ignores --fast's 24fps and produces
+    # 49-frame clips that get 2× blend-retimed into watercolor blur.
+    fps      = args.fps or model_info.get("default_fps") or 8
     seed     = args.seed
     steps    = args.num_steps
     guidance = args.guidance

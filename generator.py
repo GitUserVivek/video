@@ -139,10 +139,13 @@ _DUR_PATTERN = re.compile(
 _FPS_PATTERN = re.compile(r"\b(\d+)\s*fps\b", re.I)
 
 # Quality → step multiplier
+# NOTE: "fast" / "quick" only halve steps when they clearly describe quality intent
+# (e.g. "draft quality", "quick sketch") — not when they describe scene motion
+# (e.g. "running fast", "fast car").  Require them next to a quality/render word.
 _QUALITY_MAP: list[tuple[re.Pattern, float]] = [
     (re.compile(r"\bultimate\b|\bmaximum quality\b|\bbest quality\b", re.I), 1.4),
     (re.compile(r"\bhigh quality\b|\bcinematic\b|\b4k\b",             re.I), 1.2),
-    (re.compile(r"\bdraft\b|\bfast\b|\blow quality\b|\bquick\b",      re.I), 0.5),
+    (re.compile(r"\bdraft\b|\blow quality\b|\bquick sketch\b|\bfast render\b|\blow[- ]res\b", re.I), 0.5),
 ]
 
 
@@ -463,11 +466,13 @@ def _make_progress_callback(total_steps: int, total_frames: int, pass_label: str
                     flush=True,
                 )
             else:
-                # Callback never fired — denoising is running silently
-                # Estimate very roughly: 2b @ 720p ≈ 25-30s/step on 2×T4
-                est_step_sec = 28.0
-                est_done = max(0, int((elapsed - 120) / est_step_sec))  # subtract ~2min setup
-                est_done = min(est_done, total_steps - 1)
+                # Callback never fired — denoising is running silently.
+                # Estimate step time: 2b @ 720p with native SDPA on 2×T4 ≈ 20-25s/step.
+                # Setup (model load + text encode) takes ~2-3 min.
+                est_step_sec = 22.0
+                setup_sec    = 180.0
+                denoising_elapsed = max(0.0, elapsed - setup_sec)
+                est_done  = min(int(denoising_elapsed / est_step_sec), total_steps - 1)
                 est_remaining = max(0, (total_steps - est_done) * est_step_sec)
                 print(
                     f"[gen] … denoising in progress  "
